@@ -323,26 +323,46 @@ async function checkRecoveryKey(req: Request): Promise<UserRow> {
   return row;
 }
 
-/** Step 1 of account recovery: prove the recovery key, receive the private key encrypted under it. */
+/**
+ * Step 1 of account recovery: prove the recovery key, receive the private key encrypted under it. With a second
+ * factor, nothing but `mfaRequired` comes back until a valid `mfaCode` is given; the answer then also carries a
+ * one-time token that step 2 requires.
+ */
 authApi.post("/recover", async (req, res) => {
   const row = await checkRecoveryKey(req);
   checkSuspended(row.id);
-  // With a second factor, step 2 needs a code too: the client asks for it before going on.
-  res.json({ userId: row.id, publicKey: row.public_key, recoveryEncPrivateKey: row.recovery_enc_private_key, mfaRequired: !!row.totp_enabled });
+  let mfaToken: string | undefined;
+  if (row.totp_enabled) {
+    const code = typeof req.body.mfaCode === "string" ? req.body.mfaCode.slice(0, 40) : "";
+    if (!code) {
+      res.json({ mfaRequired: true });
+      return;
+    }
+    const keys = { account: row.id, ip: req.ip! };
+    assertNotLocked("mfa", keys);
+    const used = checkSecondFactor(row, code);
+    if (!used) throw await badCode(row.id, req.ip!);
+    succeeded("mfa", keys);
+    if (used === "backup") securityEvent("mfa_backup_used", { account: row.id, remaining: backupRemaining(row.id) });
+    mfaToken = issueMfaToken(row.id, "recover");
+  }
+  res.json({ userId: row.id, publicKey: row.public_key, recoveryEncPrivateKey: row.recovery_enc_private_key, mfaToken });
 });
 
 /** Step 2: set a new password (re-encrypted private key), logging out every other session. */
 authApi.post("/recover/finish", async (req, res) => {
   const row = await checkRecoveryKey(req);
   checkSuspended(row.id);
-  // The recovery key alone must not get around the second factor.
+  // The recovery key alone must not get around the second factor: step 1 gave a token for a valid code.
+  const mfaToken = typeof req.body.mfaToken === "string" ? req.body.mfaToken.slice(0, 100) : "";
   if (row.totp_enabled) {
     const keys = { account: row.id, ip: req.ip! };
     assertNotLocked("mfa", keys);
-    const used = checkSecondFactor(row, String(req.body.mfaCode ?? "").slice(0, 40));
-    if (!used) throw await badCode(row.id, req.ip!);
-    succeeded("mfa", keys);
-    if (used === "backup") securityEvent("mfa_backup_used", { account: row.id, remaining: backupRemaining(row.id) });
+    if (mfaTokenUser(mfaToken, "recover") !== row.id) {
+      strikeMfaToken(mfaToken);
+      throw await badCode(row.id, req.ip!);
+    }
+    dropMfaToken(mfaToken);
   }
   db.prepare("UPDATE users SET auth_hash = ?, kdf_salt = ?, enc_private_key = ? WHERE id = ?").run(
     await hashSecretAsync(blob(req.body.authKey, 100)),

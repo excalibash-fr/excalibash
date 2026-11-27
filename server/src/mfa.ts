@@ -43,13 +43,17 @@ export function clearMfa(userId: string): void {
 // ---- Backup codes -----------------------------------------------------------------------
 
 const BACKUP_ALPHABET = "23456789ABCDEFGHJKMNPQRSTUVWXYZ"; // no 0/1/I/L/O: readable on paper
+/** Backup codes are kept as HMAC-SHA256 under a key derived from server_secret (not a bare hash of a 50-bit code). */
+let backupKey: Buffer | undefined;
+const backupHash = (code: string): string =>
+  createHmac("sha256", (backupKey ??= createHmac("sha256", serverSecret()).update("excalibash backup code v1").digest())).update(code).digest("hex");
 const normalizeBackup = (code: string) => code.toUpperCase().replace(/[^A-Z0-9]/g, "");
 
 /** Replaces the user's backup codes by 10 new ones ("XXXXX-XXXXX"); only their hashes are kept. Inside a transaction. */
 function writeBackupCodes(userId: string): string[] {
   const codes = Array.from({ length: 10 }, () => Array.from({ length: 10 }, () => BACKUP_ALPHABET[randomInt(BACKUP_ALPHABET.length)]).join(""));
   db.prepare("DELETE FROM mfa_backup_codes WHERE user_id = ?").run(userId);
-  for (const c of codes) db.prepare("INSERT INTO mfa_backup_codes (user_id, code_hash) VALUES (?, ?)").run(userId, sha256(c));
+  for (const c of codes) db.prepare("INSERT INTO mfa_backup_codes (user_id, code_hash) VALUES (?, ?)").run(userId, backupHash(c));
   return codes.map((c) => `${c.slice(0, 5)}-${c.slice(5)}`);
 }
 
@@ -74,7 +78,7 @@ export function checkSecondFactor(row: UserRow, code: string): "totp" | "backup"
   }
   const norm = normalizeBackup(code);
   if (norm.length !== 10) return null;
-  return db.prepare("DELETE FROM mfa_backup_codes WHERE user_id = ? AND code_hash = ?").run(row.id, sha256(norm)).changes === 1 ? "backup" : null;
+  return db.prepare("DELETE FROM mfa_backup_codes WHERE user_id = ? AND code_hash = ?").run(row.id, backupHash(norm)).changes === 1 ? "backup" : null;
 }
 
 // ---- Admins -----------------------------------------------------------------------------
@@ -86,25 +90,26 @@ export const mfaRequiredForAdmins = (): boolean => getSetting("mfa_required_admi
 const TOKEN_TTL = 5 * 60_000;
 const TOKEN_TRIES = 5;
 const MAX_TOKENS = 10_000;
-type Pending = { userId: string; expires: number; tries: number };
+type Kind = "login" | "recover"; // a token of one flow never works in the other
+type Pending = { userId: string; kind: Kind; expires: number; tries: number };
 const tokens = new Map<string, Pending>(); // by sha256 of the token: a memory dump does not yield usable tokens
 
-export function issueMfaToken(userId: string): string {
+export function issueMfaToken(userId: string, kind: Kind = "login"): string {
   const now = Date.now();
   if (tokens.size >= MAX_TOKENS) {
     for (const [k, t] of tokens) if (t.expires <= now) tokens.delete(k);
     if (tokens.size >= MAX_TOKENS) tokens.delete(tokens.keys().next().value!);
   }
   const token = randomBytes(32).toString("base64url");
-  tokens.set(sha256(token), { userId, expires: now + TOKEN_TTL, tries: 0 });
+  tokens.set(sha256(token), { userId, kind, expires: now + TOKEN_TTL, tries: 0 });
   return token;
 }
 
 /** The user a live token belongs to. */
-export function mfaTokenUser(token: unknown): string | undefined {
+export function mfaTokenUser(token: unknown, kind: Kind = "login"): string | undefined {
   if (typeof token !== "string") return undefined;
   const t = tokens.get(sha256(token));
-  return t && t.expires > Date.now() ? t.userId : undefined;
+  return t && t.kind === kind && t.expires > Date.now() ? t.userId : undefined;
 }
 
 /** A wrong code: the token is destroyed at its 5th. */

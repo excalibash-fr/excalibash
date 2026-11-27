@@ -2289,24 +2289,35 @@ if (process.env.UPDATE_V1_BIN && process.env.UPDATE_SIGN && process.env.UPDATE_K
   {
     const rec = await c.recoveryKeys(c.parseRecoveryKey(maxine.recovery));
     jar.current = "";
-    const step1 = await patient(() => api("POST", "/auth/recover", { email: "maxine@test.local", recoveryAuth: rec.recoveryAuth }));
-    ok(step1.status === 200 && step1.body.mfaRequired === true && jar.current === "", "récupération : étape 1 annonce mfaRequired");
+    const recover1 = (mfaCode?: string) => patient(() => api("POST", "/auth/recover", { email: "maxine@test.local", recoveryAuth: rec.recoveryAuth, mfaCode }));
+    const step0 = await recover1();
+    ok(step0.status === 200 && step0.body.mfaRequired === true && jar.current === "", "récupération : étape 1 sans code annonce mfaRequired");
+    ok(!("recoveryEncPrivateKey" in step0.body) && !("userId" in step0.body) && !("publicKey" in step0.body) && !JSON.stringify(step0.body).includes(maxine.user.id), "récupération : étape 1 sans code ne livre ni clé chiffrée, ni identifiant, ni clé publique");
+    const w1 = await recover1("000000");
+    ok(w1.status === 401 && w1.body.error === "Code incorrect" && !("recoveryEncPrivateKey" in w1.body), "récupération : étape 1 avec un mauvais code → 401 « Code incorrect »");
+    const step1 = await recover1(maxCodes[1]);
+    ok(step1.status === 200 && !!step1.body.recoveryEncPrivateKey && typeof step1.body.mfaToken === "string", "récupération : étape 1 avec un code de secours livre la clé chiffrée et un jeton");
     const pkcs8 = await c.unbox(rec.recoveryEnc, step1.body.recoveryEncPrivateKey, c.AAD.priv(maxine.user.id));
     const newPw = "maxine-nouveau-mdp-1";
     const salt = c.toB64(c.randomBytes(16));
     const nk = await c.deriveAccountKeys(newPw, salt);
-    const finish = async (mfaCode?: string) =>
+    const finish = async (mfaToken?: string) =>
       patient(async () =>
-        api("POST", "/auth/recover/finish", { email: "maxine@test.local", recoveryAuth: rec.recoveryAuth, mfaCode, salt, authKey: nk.authKey, encPrivateKey: await c.box(nk.masterKey, pkcs8, c.AAD.priv(maxine.user.id)) }),
+        api("POST", "/auth/recover/finish", { email: "maxine@test.local", recoveryAuth: rec.recoveryAuth, mfaToken, salt, authKey: nk.authKey, encPrivateKey: await c.box(nk.masterKey, pkcs8, c.AAD.priv(maxine.user.id)) }),
       );
     const f0 = await finish();
-    ok(f0.status === 401 && f0.body.error === "Code incorrect" && jar.current === "", "récupération : sans code, refusée (la clé ne suffit pas)");
-    const f1 = await finish("000000");
-    ok(f1.status === 401 && JSON.stringify(f1.body) === JSON.stringify(f0.body), "récupération : mauvais code, même réponse");
-    ok((await as(maxine, () => api("GET", "/auth/me"))).status === 200 && (await loginStep1("maxine@test.local", maxPw)).status === 200, "récupération : rien n'a changé après les refus (ancien mot de passe valable)");
+    ok(f0.status === 401 && f0.body.error === "Code incorrect" && jar.current === "", "récupération : étape 2 sans jeton refusée (la clé ne suffit pas)");
+    const lt = await loginStep1("maxine@test.local", maxPw);
+    const f1 = await finish(lt.body.mfaToken);
+    ok(f1.status === 401 && JSON.stringify(f1.body) === JSON.stringify(f0.body), "récupération : étape 2 avec un jeton de connexion refusée");
+    const other = await recover1(); // no code: nothing to take from here
+    const f1b = await finish("x".repeat(43));
+    ok(other.status === 200 && f1b.status === 401, "récupération : étape 2 avec un jeton inconnu refusée");
+    ok((await as(maxine, () => api("GET", "/auth/me"))).status === 200, "récupération : rien n'a changé après les refus (session et ancien mot de passe valables)");
     jar.current = "";
-    const f2 = await finish(maxCodes[1]);
-    ok(f2.status === 200 && f2.body.user?.id === maxine.user.id && jar.current.length > 0, "récupération : avec un code de secours, le mot de passe est redéfini et la session ouverte");
+    const f2 = await finish(step1.body.mfaToken);
+    ok(f2.status === 200 && f2.body.user?.id === maxine.user.id && jar.current.length > 0, "récupération : avec le jeton de l'étape 1, le mot de passe est redéfini et la session ouverte");
+    ok((await finish(step1.body.mfaToken)).status === 401, "récupération : le jeton ne sert qu'une fois");
     maxPw = newPw;
     maxine = { ...maxine, cookie: jar.current };
     const old = await loginStep1("maxine@test.local", "maxine-password-1");
@@ -2345,6 +2356,9 @@ if (process.env.UPDATE_V1_BIN && process.env.UPDATE_SIGN && process.env.UPDATE_K
   const locked = await api("POST", "/auth/mfa", { mfaToken: tN3.body.mfaToken, code: fresh(nol.secret, nolan.user.id) });
   ok(locked.status === 429 && /plus tard/.test(locked.body.error) && jar.current === "", "force brute : 10 mauvais codes → compte verrouillé, même avec le bon code (429)");
   ok(logLines().some((l) => l.includes(`event=account_locked scope=mfa account=${nolan.user.id}`)), "journal : account_locked scope=mfa");
+  const nrec = await c.recoveryKeys(c.parseRecoveryKey(nolan.recovery));
+  const lockedRecover = await patient(() => api("POST", "/auth/recover", { email: "nolan@test.local", recoveryAuth: nrec.recoveryAuth, mfaCode: fresh(nol.secret, nolan.user.id) }));
+  ok(lockedRecover.status === 429 && /plus tard/.test(lockedRecover.body.error) && !("recoveryEncPrivateKey" in lockedRecover.body), "force brute : le verrou « mfa » vaut aussi pour la récupération (429, aucune clé)");
 
   // ---- Required for admins ----
   const reqNoMfa = await as(alice, () => api("PATCH", "/admin/settings", { mfaRequiredAdmins: true }));

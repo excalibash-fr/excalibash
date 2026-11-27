@@ -173,16 +173,17 @@ export async function unlock(user: User, password: string): Promise<KeyPair> {
 
 export async function recover(email: string, recoveryKey: string, newPassword: string): Promise<Session | MfaStep> {
   const rec = await recoveryKeys(parseRecoveryKey(recoveryKey));
-  const r = await api.post<{ userId: string; publicKey: string; recoveryEncPrivateKey: string; mfaRequired?: boolean }>("/auth/recover", { email, recoveryAuth: rec.recoveryAuth });
-  const pkcs8 = await unbox(rec.recoveryEnc, r.recoveryEncPrivateKey, AAD.priv(r.userId));
-  await openKeyPair(pkcs8, r.publicKey); // refuse before touching the account if the server lies
-  const salt = toB64(randomBytes(16));
-  const { authKey, masterKey } = await deriveAccountKeys(newPassword, salt);
-  const finish = async (mfaCode?: string): Promise<Session> => {
+  type Step1 = { userId: string; publicKey: string; recoveryEncPrivateKey: string; mfaToken?: string; mfaRequired?: boolean };
+  const step1 = (mfaCode?: string) => api.post<Step1>("/auth/recover", { email, recoveryAuth: rec.recoveryAuth, mfaCode });
+  const finish = async (r: Step1): Promise<Session> => {
+    const pkcs8 = await unbox(rec.recoveryEnc, r.recoveryEncPrivateKey, AAD.priv(r.userId));
+    await openKeyPair(pkcs8, r.publicKey); // refuse before touching the account if the server lies
+    const salt = toB64(randomBytes(16));
+    const { authKey, masterKey } = await deriveAccountKeys(newPassword, salt);
     const done = await api.post<{ user: User }>("/auth/recover/finish", {
       email,
       recoveryAuth: rec.recoveryAuth,
-      mfaCode,
+      mfaToken: r.mfaToken,
       salt,
       authKey,
       encPrivateKey: await box(masterKey, pkcs8, AAD.priv(r.userId)),
@@ -191,8 +192,10 @@ export async function recover(email: string, recoveryKey: string, newPassword: s
     await storeKeys(done.user.id, keys);
     return { user: done.user, keys };
   };
-  // With a second factor the recovery key is not enough: the code is asked before the password is replaced.
-  return r.mfaRequired ? { mfaRequired: true, finish } : finish();
+  const r = await step1();
+  // With a second factor the server gives nothing until a code comes with the recovery key: ask for it, then go on.
+  if (r.mfaRequired) return { mfaRequired: true, finish: async (code) => finish(await step1(code)) };
+  return finish(r);
 }
 
 export async function changePassword(user: User, current: string, next: string): Promise<void> {

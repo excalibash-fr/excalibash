@@ -84,14 +84,16 @@ un chiffré d'un objet à un autre.
     la clé privée, jamais envoyés). Le secret est chiffré en AES-256-GCM (lié à l'identifiant du compte) avec une clé dérivée de
     `server_secret`, qui se trouve dans la même base : le chiffrement protège les exports partiels et les journaux, pas contre
     quelqu'un qui détient toute la base. Les 10 codes de secours (`XXXXX-XXXXX`, alphabet sans caractères ambigus, affichés une seule fois) ne sont gardés
-    que sous forme de hachage SHA-256 et chacun est supprimé à l'usage.
+    que sous forme de HMAC-SHA256 (clé dérivée de `server_secret`, comme pour le secret TOTP) et chacun est supprimé à l'usage.
   - *Connexion* : avec le bon mot de passe et la double authentification active, `/api/auth/login` ne crée ni session ni ne renvoie
     de clés : il répond `mfaRequired` et un jeton à usage unique (32 octets aléatoires, gardé haché en mémoire, valable 5 minutes,
     détruit au 5e mauvais code). `POST /api/auth/mfa` (jeton + code TOTP ou code de secours) ouvre alors la session. Les échecs
     comptent dans la fonction « mfa » du verrou contre la force brute (par compte et par adresse, contrôlé avant toute
     vérification) ; un mauvais code, un code de secours inconnu et un jeton périmé donnent la même réponse « Code incorrect ».
-  - *Récupération* : la clé de récupération ne contourne pas le second facteur. Pour un compte qui en a un, `/recover` indique
-    `mfaRequired` et `/recover/finish` exige un code (même contrôle, même réponse d'erreur). Un compte qui a perdu sa clé de
+  - *Récupération* : la clé de récupération ne contourne pas le second facteur. Pour un compte qui en a un, `/recover` (étape 1)
+    ne répond que `mfaRequired` (ni clé chiffrée, ni identifiant) tant qu'un code valide (TOTP ou secours) n'accompagne pas la clé de
+    récupération ; avec lui, il livre les clés et un jeton à usage unique (5 minutes, propre à la récupération : il ne sert pas à
+    la connexion), que `/recover/finish` exige. Même verrou « mfa » et même réponse « Code incorrect » à chaque refus. Un compte qui a perdu sa clé de
     récupération, son mot de passe **et** son second facteur (appareil et codes de secours) n'est pas récupérable par lui-même : un administrateur
     peut réinitialiser la double authentification (sans toucher au mot de passe ni aux données), mais pas récupérer le compte.
   - *Gestion* : activer, régénérer les codes de secours et désactiver passent par `/api/account/mfa/*` ; le mot de passe est redemandé
