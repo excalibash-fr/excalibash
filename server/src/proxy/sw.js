@@ -157,6 +157,44 @@ async function tunnelOf(e, url) {
 
 const HOP = new Set(["connection", "keep-alive", "transfer-encoding", "upgrade", "host", "content-length", "accept-encoding", "cookie"]);
 
+// ---- relay pacing -----------------------------------------------------------------------
+//
+// The agent forwards at most 32 requests at a time and answers a busy 503 beyond, without forwarding.
+// Sites that load dozens of files at once (webpack chunks…) would lose some: requests of a tunnel wait
+// their turn here, and a busy answer (or the server's 429) is tried again after a growing pause.
+const MAX_PARALLEL = 16;
+const BUSY_RETRIES = 6;
+const BUSY_BODY = "Excalibash : trop de requêtes simultanées";
+const lanes = new Map(); // tunnel id -> { running, waiting }
+
+async function takeSlot(id) {
+  let lane = lanes.get(id);
+  if (!lane) lanes.set(id, (lane = { running: 0, waiting: [] }));
+  if (lane.running < MAX_PARALLEL) {
+    lane.running++;
+    return;
+  }
+  await new Promise((r) => lane.waiting.push(r)); // the slot is handed over by releaseSlot
+}
+
+function releaseSlot(id) {
+  const lane = lanes.get(id);
+  if (!lane) return;
+  const next = lane.waiting.shift();
+  if (next) next();
+  else if (--lane.running === 0) lanes.delete(id);
+}
+
+/** The agent's own "too many requests" answer (authenticated, the site never saw the request). */
+function agentBusy(res) {
+  if (res.s !== 503 || typeof res.b !== "string") return false;
+  try {
+    return dec.decode(unb64(res.b)) === BUSY_BODY;
+  } catch {
+    return false;
+  }
+}
+
 self.addEventListener("fetch", (e) => {
   const url = new URL(e.request.url);
   if (url.origin !== self.location.origin || url.pathname.startsWith("/eb-proxy/")) return;
@@ -191,27 +229,46 @@ async function handle(e, url) {
   if (headers.referer && headers.referer[0].startsWith(own)) headers.referer = [t.target.origin + basePath(t.target) + headers.referer[0].slice(own.length)];
   const body = ["GET", "HEAD"].includes(e.request.method) ? new Uint8Array() : new Uint8Array(await e.request.arrayBuffer());
 
-  const rid = b64(crypto.getRandomValues(new Uint8Array(16)));
-  const ts = Date.now();
-  const d = await box(t.key, enc.encode(JSON.stringify({ m: e.request.method, p: route.path, h: headers, b: b64(body) })), `eb:http-req:${route.id}:${rid}:${ts}`);
-  let reply;
-  try {
-    const r = await fetch(`/eb-proxy/req/${route.id}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ rid, ts, d }) });
-    if (HOST_ID && r.status === 404) {
-      // Session expired or server restarted: a page load goes back through the boot page to shake hands again.
-      if (e.request.mode === "navigate") return fetch(e.request);
-      return new Response(null, { status: 404, headers: { "cache-control": "no-store" } });
-    }
-    if (!r.ok) return errorPage(r.status === 404 ? "Ce tunnel n'existe plus." : "La machine est hors ligne ou ne répond pas.");
-    reply = await r.json();
-  } catch {
-    return errorPage("Impossible de joindre Excalibash.");
-  }
+  const plain = enc.encode(JSON.stringify({ m: e.request.method, p: route.path, h: headers, b: b64(body) }));
   let res;
-  try {
-    res = JSON.parse(dec.decode(await unbox(t.key, reply.d, `eb:http-res:${route.id}:${rid}`)));
-  } catch {
-    return errorPage("Réponse refusée : elle n'est pas authentique.");
+  for (let attempt = 0; ; attempt++) {
+    // A fresh nonce for every try: the agent refuses a frame it has already seen.
+    const rid = b64(crypto.getRandomValues(new Uint8Array(16)));
+    const ts = Date.now();
+    const d = await box(t.key, plain, `eb:http-req:${route.id}:${rid}:${ts}`);
+    let reply;
+    let busy = false;
+    await takeSlot(route.id);
+    try {
+      const r = await fetch(`/eb-proxy/req/${route.id}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ rid, ts, d }) });
+      if (HOST_ID && r.status === 404) {
+        // Session expired or server restarted: a page load goes back through the boot page to shake hands again.
+        if (e.request.mode === "navigate") return fetch(e.request);
+        return new Response(null, { status: 404, headers: { "cache-control": "no-store" } });
+      }
+      if (r.status === 429) busy = true;
+      else if (!r.ok) return errorPage(r.status === 404 ? "Ce tunnel n'existe plus." : "La machine est hors ligne ou ne répond pas.");
+      else reply = await r.json();
+    } catch {
+      return errorPage("Impossible de joindre Excalibash.");
+    } finally {
+      releaseSlot(route.id);
+    }
+    if (!busy) {
+      try {
+        res = JSON.parse(dec.decode(await unbox(t.key, reply.d, `eb:http-res:${route.id}:${rid}`)));
+      } catch {
+        return errorPage("Réponse refusée : elle n'est pas authentique.");
+      }
+      busy = agentBusy(res);
+    }
+    if (!busy) break;
+    // Neither the server (429) nor a busy agent forwarded the request: trying again is safe, even for a POST.
+    if (attempt >= BUSY_RETRIES) {
+      if (res) break; // the agent's own 503 goes to the page
+      return errorPage("La machine est hors ligne ou ne répond pas.");
+    }
+    await new Promise((r) => setTimeout(r, 150 * 2 ** attempt + Math.random() * 100));
   }
 
   const out = new Headers();
