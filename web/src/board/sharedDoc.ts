@@ -86,7 +86,12 @@ class Shared {
   /** Outgoing frames are encrypted and sent in order. */
   private chain: Promise<void> = Promise.resolve();
 
-  constructor(private host: DocHost, readonly docId: string) {
+  private host: DocHost;
+  readonly docId: string;
+
+  constructor(host: DocHost, docId: string) {
+    this.host = host;
+    this.docId = docId;
     this.synced = new Promise((r) => (this.resolveSynced = r));
     this.ydoc.on("update", (u: Uint8Array, origin: unknown) => {
       if (origin === REMOTE || !this.host.canEdit) return;
