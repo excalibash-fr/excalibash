@@ -46,13 +46,14 @@ function endData(v: any): EndInfo | undefined {
   if (dx || dy) Object.assign(e, { dx: dx * k, dy: dy * k });
   return e;
 }
-const isVlan = (k: string) => /^\d{1,4}$/.test(k) && +k >= 1 && +k <= 4094;
+/** A VLAN number as text: digits only, 1 to 4094. */
+export const isVlanId = (v: string): boolean => /^\d{1,4}$/.test(v) && +v >= 1 && +v <= 4094;
 function vlanIpsData(v: any): Record<string, string> | undefined {
   if (!v || typeof v !== "object" || Array.isArray(v)) return undefined;
   // A plain object: it ends up in the element's customData, which Excalidraw deep-copies with
   // hasOwnProperty. Keys are VLAN numbers only, so "__proto__" and the like never get in.
   const out: Record<string, string> = {};
-  for (const [k, ip] of Object.entries(v).slice(0, 128)) if (isVlan(k) && s(ip)) out[k] = (ip as string).slice(0, 64);
+  for (const [k, ip] of Object.entries(v).slice(0, 128)) if (isVlanId(k) && s(ip)) out[k] = (ip as string).slice(0, 64);
   return Object.keys(out).length ? out : undefined;
 }
 const normalizedCables = new WeakMap<object, CableData>();
@@ -80,10 +81,9 @@ export function anchorOf(el: El, byId: Map<string, El>): Anchor {
 /** VLAN list as typed ("10, 20,30-35"): normalized, or null when a part is not a VLAN or range. */
 export function parseVlans(v: string): string | null {
   const parts = v.split(",").map((s) => s.trim()).filter(Boolean);
-  const ok = (n: string) => /^\d{1,4}$/.test(n) && +n >= 1 && +n <= 4094;
   for (const part of parts) {
     const [lo, hi, extra] = part.split("-").map((s) => s.trim());
-    if (extra !== undefined || !ok(lo) || (hi !== undefined && (!ok(hi) || +hi < +lo))) return null;
+    if (extra !== undefined || !isVlanId(lo) || (hi !== undefined && (!isVlanId(hi) || +hi < +lo))) return null;
   }
   return parts.map((p) => p.replace(/\s+/g, "")).join(", ");
 }
@@ -106,6 +106,6 @@ export function vlanParts(i?: EndInfo): { plain: string[]; withIp: [string, stri
   const parts = (parseVlans(i.vlans) ?? i.vlans).split(",").map((p) => p.trim()).filter(Boolean);
   // Own numeric keys only: a VLAN written "constructor" must not find Object.prototype.
   const ips = i.vlanIps ?? {};
-  const ipOf = (p: string) => (isVlan(p) && Object.hasOwn(ips, p) && typeof ips[p] === "string" ? ips[p] : undefined);
+  const ipOf = (p: string) => (isVlanId(p) && Object.hasOwn(ips, p) && typeof ips[p] === "string" ? ips[p] : undefined);
   return { plain: parts.filter((p) => !ipOf(p)), withIp: parts.filter((p) => ipOf(p)).map((p) => [p, ipOf(p)!]) };
 }

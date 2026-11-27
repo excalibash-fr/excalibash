@@ -28,15 +28,14 @@ import (
 // names, paths, contents, interface names and filters are all inside the boxes.
 
 const (
-	maxFileSize   = 200 << 20
-	fileChunk     = 192 << 10
-	maxLsEntries  = 500
-	lsScanLimit   = 5000
-	maxXfers      = 4
-	xferIdle      = 60 * time.Second
-	streamWindow  = 8 // chunks sent ahead of the client's acknowledgements
-	maxFileNonces = 32768
-	maxNameBytes  = 255
+	maxFileSize  = 200 << 20
+	fileChunk    = 192 << 10
+	maxLsEntries = 500
+	lsScanLimit  = 5000
+	maxXfers     = 4
+	xferIdle     = 60 * time.Second
+	streamWindow = 8 // chunks sent ahead of the client's acknowledgements
+	maxNameBytes = 255
 )
 
 var (
@@ -78,15 +77,15 @@ type fileOp struct {
 type fileHub struct {
 	m *manager
 
-	mu        sync.Mutex
-	nonces    map[string]time.Time
-	lastPrune time.Time
-	xfers     map[string]*xfer
-	active    int
+	nonces *nonceSet
+
+	mu     sync.Mutex
+	xfers  map[string]*xfer
+	active int
 }
 
 func newFileHub(m *manager) *fileHub {
-	return &fileHub{m: m, nonces: map[string]time.Time{}, xfers: map[string]*xfer{}}
+	return &fileHub{m: m, nonces: newNonceSet(maxFileNonces), xfers: map[string]*xfer{}}
 }
 
 // xfer is one running transfer (upload, download or capture) of a terminal.
@@ -115,11 +114,11 @@ func (x *xfer) touch() { x.idle.Reset(xferIdle) }
 // handle authenticates one "file" frame and dispatches it. The cheap, ordering-sensitive part
 // runs on the read loop; the work runs in goroutines.
 func (h *fileHub) handle(msg message, out *outbox) {
-	ts, err := strconv.ParseInt(string(msg.Ts), 10, 64)
-	if err != nil || msg.ID == "" || msg.Rid == "" || len(msg.Rid) > 64 {
+	ts, ok := parseTs(msg.Ts)
+	if !ok || msg.ID == "" || msg.Rid == "" || len(msg.Rid) > 64 {
 		return
 	}
-	if skew := time.Since(time.UnixMilli(ts)); skew > inputMaxSkew || skew < -inputMaxSkew {
+	if !tsInWindow(ts) {
 		debugf("file %s: timestamp out of window", msg.ID)
 		return
 	}
@@ -137,7 +136,7 @@ func (h *fileHub) handle(msg message, out *outbox) {
 		return
 	}
 	// Authoritative anti-replay: check and record atomically, only for authenticated frames.
-	if !h.fresh(msg.ID + "/" + msg.Rid) {
+	if !h.nonces.claim(msg.ID + "/" + msg.Rid) {
 		return
 	}
 	var op fileOp
@@ -223,26 +222,6 @@ func (h *fileHub) sessionKey(id string) ([]byte, source) {
 		return nil, nil
 	}
 	return append([]byte(nil), s.key...), s.src
-}
-
-// fresh records an authenticated frame id and refuses one already seen.
-func (h *fileHub) fresh(nonce string) bool {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	now := time.Now()
-	if now.Sub(h.lastPrune) > noncePruneEvery {
-		h.lastPrune = now
-		for n, at := range h.nonces {
-			if now.Sub(at) > nonceLifetime {
-				delete(h.nonces, n)
-			}
-		}
-	}
-	if _, seen := h.nonces[nonce]; seen || len(h.nonces) >= maxFileNonces {
-		return false
-	}
-	h.nonces[nonce] = now
-	return true
 }
 
 func (h *fileHub) find(term, id string) *xfer {

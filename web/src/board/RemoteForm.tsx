@@ -4,14 +4,13 @@ import type { RemoteHop, RemoteTarget } from "../api.ts";
 import { useKeys } from "../auth.tsx";
 import { listMachines, type Machine } from "../vault.ts";
 import { Modal, toast } from "../components/ui.tsx";
+import { HOST_RE, USER_RE, stripBrackets } from "../validators.ts";
 
 /** A form in its own modal, or bare when it is one panel of a larger dialog. */
 export function FormFrame({ bare, onClose, children }: { bare?: boolean; onClose: () => void; children: React.ReactNode }) {
   return bare ? <>{children}</> : <Modal onClose={onClose} width={560}>{children}</Modal>;
 }
 
-export const HOST_RE = /^[A-Za-z0-9._:-]{1,253}$/;
-const USER_RE = /^[A-Za-z0-9._@-]{0,64}$/;
 const DEFAULT_PORT: Record<RemoteTarget["kind"], string> = { telnet: "23", ssh: "22", raw: "", jupyter: "" };
 
 /** The machines of the user, with one picked (the given default, else the first one). */
@@ -81,10 +80,10 @@ const hopRow = (h: RemoteHop): HopRow => ({
 });
 const hopOk = (h: HopRow) => {
   const p = Number(h.port);
-  return HOST_RE.test(h.host.trim().replace(/^\[|\]$/g, "")) && USER_RE.test(h.user.trim()) && Number.isInteger(p) && p > 0 && p < 65536;
+  return HOST_RE.test(stripBrackets(h.host.trim())) && USER_RE.test(h.user.trim()) && Number.isInteger(p) && p > 0 && p < 65536;
 };
 const hopOf = (h: HopRow): RemoteHop => ({
-  host: h.host.trim().replace(/^\[|\]$/g, ""),
+  host: stripBrackets(h.host.trim()),
   port: Number(h.port),
   ...(h.user.trim() ? { user: h.user.trim() } : {}),
   ...(h.legacy ? { legacyKex: true, legacyHostKey: true, legacyCiphers: true } : {}),
@@ -136,7 +135,7 @@ export function RemoteForm({
   }, [legacyCount]);
 
   const ssh = kind === "ssh";
-  const cleanHost = host.trim().replace(/^\[|\]$/g, "");
+  const cleanHost = stripBrackets(host.trim());
   const cleanUser = user.trim();
   const portNum = Number(port);
   const hostOk = HOST_RE.test(cleanHost);

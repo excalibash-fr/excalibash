@@ -37,7 +37,7 @@ export const MAX_STREAM_TEXT = 1024 * 1024;
 export const STREAM_CHUNK = 32 * 1024;
 export const NBFORMAT_MINOR = 5;
 /** Largest .ipynb the window opens or writes (a document is limited to 8 MiB once sealed). */
-export const MAX_NOTEBOOK_BYTES = 6 * 1024 * 1024;
+export const MAX_NOTEBOOK_BYTES = 5 * 1024 * 1024; // its Yjs state must fit a sealed snapshot (8 MiB, server/src/docs.ts)
 
 export class NotebookFormatError extends Error {}
 
@@ -358,6 +358,15 @@ export function finishRun(ydoc: Y.Doc, execId: string, count?: number | null): b
     if (count !== undefined) c.map.set("execution_count", count);
     c.map.delete("running");
   });
+  return true;
+}
+
+/** Empties the outputs of the cell running under `execId` (its run is about to be rebuilt from a replay). */
+export function resetRunOutputs(ydoc: Y.Doc, cellId: string, execId: string): boolean {
+  const c = findCell(ydoc, cellId);
+  const outs = c?.running === execId ? c.map.get("outputs") : undefined;
+  if (!(outs instanceof Y.Array)) return false;
+  if (outs.length) ydoc.transact(() => outs.delete(0, outs.length));
   return true;
 }
 

@@ -1,7 +1,7 @@
 // Unit tests of the code-window rules (pure, no framework):
 //   node --experimental-strip-types web/src/board/code.test.ts     (or: npx tsx web/src/board/code.test.ts)
 import * as Y from "yjs";
-import { EMPTY_SHA, cursorStyleSheet, initBlank, initFromFile, isDirty, languageForName, markSaved, readMeta, runCommand, safeColor, safeLabel, sha256Hex, splitPath } from "./codeDoc.ts";
+import { EMPTY_SHA, cursorStyleSheet, diffOutcome, initBlank, initFromFile, isDirty, languageForName, markSaved, readMeta, runCommand, safeColor, safeLabel, sha256Hex, splitPath } from "./codeDoc.ts";
 import { MAX_CODES, MAX_LABEL, cleanLabel, labelOfName, nodeDataOf } from "./nodeData.ts";
 
 let failures = 0;
@@ -108,6 +108,14 @@ const el = (customData: unknown) => ({ customData }) as any;
   ok(codes[0].label === "demo.py" && codes[0].x === 1 && codes.slice(1).every((c) => c.label === undefined && !("label" in c)), "label : lu dans le scénario, validé entrée par entrée (géométrie conservée)");
   const nbs = node({ notebooks: [{ docId: id(6), label: "carnet.ipynb" }, { docId: id(7), label: " " }] }).notebooks!;
   ok(nbs[0].label === "carnet.ipynb" && nbs[1].label === undefined, "label : même règle pour les notebooks");
+}
+
+// Conflict diff choices
+{
+  const o = diffOutcome;
+  ok(o("overwrite").save && !o("overwrite").adopt, "conflit : écraser enregistre sans toucher au document");
+  ok(!o("take").save && o("take").adopt, "conflit : prendre la version de la machine remplace le document sans enregistrer");
+  ok(!o("cancel").save && !o("cancel").adopt, "conflit : annuler ne fait rien");
 }
 
 if (failures) {

@@ -14,17 +14,6 @@ export function exportName(title: string, ext: string, now = new Date()) {
   return `${slug}-${stamp}.${ext}`;
 }
 
-export function saveBlob(blob: Blob, filename: string) {
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = filename;
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  setTimeout(() => URL.revokeObjectURL(url), 10_000);
-}
-
 /** The whole buffer (scrollback and screen) as plain text; wrapped rows are joined back. */
 export function bufferToText(term: Terminal): string {
   const buf = term.buffer.active;

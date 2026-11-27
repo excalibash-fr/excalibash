@@ -1,19 +1,34 @@
 // Shared documents (Yjs CRDT). Everything here is opaque: updates and snapshots are ciphertext
 // boxed under the board key, the server only orders them (seq), counts them and measures their size.
 import { db, tx } from "./db.ts";
+import { isId22 } from "./validate.ts";
 
 /** 128-bit random id, base64url without padding. */
-export const isDocId = (v: unknown): v is string => typeof v === "string" && /^[A-Za-z0-9_-]{22}$/.test(v);
+export const isDocId = isId22;
 
 export const MAX_FRAME = 512 * 1024; // ciphertext of one update (base64url chars)
 export const MAX_AWARENESS = 32 * 1024;
-export const MAX_SNAPSHOT = 4 * 1024 * 1024;
 export const MAX_DOC_BYTES = 8 * 1024 * 1024; // snapshot + updates
+// A snapshot may be as big as the whole document: anything the server accepted can be compacted
+// (key rotation already stores snapshots up to MAX_DOC_BYTES). Keep in sync with sharedDoc.ts.
+export const MAX_SNAPSHOT = MAX_DOC_BYTES;
 export const MAX_DOCS_PER_BOARD = 64;
 export const COMPACT_UPDATES = 200;
 export const COMPACT_BYTES = 1024 * 1024;
 
-export const isB64 = (v: unknown, max: number): v is string => typeof v === "string" && v.length > 0 && v.length <= max && /^[A-Za-z0-9_-]+$/.test(v);
+// Ids of deleted documents: a client that was offline when the document was deleted would
+// otherwise recreate it from its local copy when it reconnects. Gone with the board.
+db.exec(`
+CREATE TABLE IF NOT EXISTS board_doc_tombstones (
+  board_id TEXT NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+  doc_id TEXT NOT NULL,
+  deleted_at INTEGER NOT NULL,
+  PRIMARY KEY (board_id, doc_id)
+);
+`);
+
+export const isDeletedDoc = (boardId: string, docId: string): boolean =>
+  !!db.prepare("SELECT 1 FROM board_doc_tombstones WHERE board_id = ? AND doc_id = ?").get(boardId, docId);
 
 type DocRow = { board_id: string; doc_id: string; epoch: number; snap: string | null; snap_seq: number; last_seq: number; bytes: number };
 
@@ -29,19 +44,20 @@ export function docState(boardId: string, docId: string): DocState {
   return { ...(r.snap ? { snap: { d: r.snap, seq: r.snap_seq } } : {}), ups };
 }
 
-export type AppendResult = { ok: true; seq: number; compact: boolean } | { ok: false; error: string };
+export type AppendResult = { ok: true; seq: number; compact: boolean } | { ok: false; error: string; gone?: boolean; tooBig?: boolean };
 
 /** Appends one ciphertext update, creating the document on first write. */
 export function appendUpdate(boardId: string, docId: string, epoch: number, d: string): AppendResult {
   return tx(() => {
     let r = row(boardId, docId);
     if (!r) {
+      if (isDeletedDoc(boardId, docId)) return { ok: false, error: "document supprimé", gone: true } as const;
       const n = (db.prepare("SELECT COUNT(*) AS n FROM board_docs WHERE board_id = ?").get(boardId) as { n: number }).n;
       if (n >= MAX_DOCS_PER_BOARD) return { ok: false, error: "trop de documents" } as const;
       db.prepare("INSERT INTO board_docs (board_id, doc_id, epoch, updated_at) VALUES (?, ?, ?, ?)").run(boardId, docId, epoch, Date.now());
       r = row(boardId, docId)!;
     }
-    if (r.bytes + d.length > MAX_DOC_BYTES) return { ok: false, error: "document trop gros" } as const;
+    if (r.bytes + d.length > MAX_DOC_BYTES) return { ok: false, error: "document trop gros", tooBig: true } as const;
     const seq = r.last_seq + 1;
     db.prepare("INSERT INTO board_doc_updates (board_id, doc_id, seq, d) VALUES (?, ?, ?, ?)").run(boardId, docId, seq, d);
     db.prepare("UPDATE board_docs SET last_seq = ?, bytes = bytes + ?, updated_at = ? WHERE board_id = ? AND doc_id = ?").run(seq, d.length, Date.now(), boardId, docId);
@@ -65,9 +81,15 @@ export function applySnapshot(boardId: string, docId: string, d: string, upto: n
   });
 }
 
-/** Permanently deletes a document (rows of its updates go with it through the foreign key). False when it did not exist. */
+/**
+ * Permanently deletes a document (rows of its updates go with it through the foreign key) and keeps
+ * a tombstone so that it is never recreated. False when it did not exist.
+ */
 export function deleteDoc(boardId: string, docId: string): boolean {
-  return db.prepare("DELETE FROM board_docs WHERE board_id = ? AND doc_id = ?").run(boardId, docId).changes > 0;
+  return tx(() => {
+    db.prepare("INSERT OR IGNORE INTO board_doc_tombstones (board_id, doc_id, deleted_at) VALUES (?, ?, ?)").run(boardId, docId, Date.now());
+    return db.prepare("DELETE FROM board_docs WHERE board_id = ? AND doc_id = ?").run(boardId, docId).changes > 0;
+  });
 }
 
 /** Everything a client needs to re-encrypt the documents of a board (key rotation). */

@@ -2965,3 +2965,43 @@ html.dark .nb-banner {
 .schema-note {
   font-family: inherit;
 }
+
+/* ---- Code window: diff overlay -------------------------------------------- */
+
+.code-diff {
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  display: flex;
+  flex-direction: column;
+  background: var(--term-bg, #fff);
+}
+.code-diff-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--line, rgba(128, 128, 128, 0.35));
+  font-size: 12px;
+}
+.code-diff-sides {
+  opacity: 0.65;
+}
+.code-diff-note {
+  padding: 4px 8px;
+  font-size: 12px;
+  opacity: 0.8;
+}
+.code-diff-body {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 60px;
+}
+.code-diff-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 6px;
+  padding: 6px 8px;
+  border-top: 1px solid var(--line, rgba(128, 128, 128, 0.35));
+}

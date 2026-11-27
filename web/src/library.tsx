@@ -317,10 +317,12 @@ type RotationSnapshot = {
 
 /**
  * Revokes access and rotates every key below `rootId`: names, wraps, elements, files,
- * previews, grants and terminal keys are all re-encrypted under fresh keys.
+ * previews, grants and terminal keys are all re-encrypted under fresh keys. Resolves to the number
+ * of shared-document parts that could not be read and were left out (see reencryptDoc).
  */
-export async function revokeAccess(ctx: Ctx, rootId: string, userId: string, onProgress?: (msg: string) => void) {
+export async function revokeAccess(ctx: Ctx, rootId: string, userId: string, onProgress?: (msg: string) => void): Promise<{ skippedDocParts: number }> {
   for (let attempt = 0; attempt < 3; attempt++) {
+    let skipped = 0;
     onProgress?.("Récupération du contenu chiffré…");
     const snap = await api.get<RotationSnapshot>(`/items/${rootId}/rotation`);
     const root = snap.items.find((i) => i.id === rootId)!;
@@ -367,11 +369,22 @@ export async function revokeAccess(ctx: Ctx, rootId: string, userId: string, onP
         // The server refuses the rotation if one of them was written since (409: we start over).
         const stored = await api.get<StoredDoc[]>(`/items/${b.id}/docs`);
         const epoch = snap.items.find((i) => i.id === b.id)!.epoch + 1;
-        const docs = await Promise.all(stored.map((d) => reencryptDoc(b.id, d, ok, nk, epoch)));
+        // Unreadable parts are left out rather than blocking the revocation (counted, reported below).
+        const docs = await Promise.all(
+          stored.map(async (d) => {
+            const { skipped: n, ...r } = await reencryptDoc(b.id, d, ok, nk, epoch);
+            skipped += n;
+            return r;
+          }),
+        );
         return { id: b.id, elements, files, preview, docs };
       }),
     );
 
+    if (skipped) {
+      console.warn("[excalibash] rotation: parts of shared documents could not be read and were left out", skipped);
+      onProgress?.(`${skipped} fragment(s) de document illisible(s) ignoré(s)…`);
+    }
     onProgress?.("Nouvelles clés pour les membres restants…");
     const grants = [];
     for (const g of snap.grants) {
@@ -422,11 +435,12 @@ export async function revokeAccess(ctx: Ctx, rootId: string, userId: string, onP
     onProgress?.("Envoi…");
     try {
       await api.post(`/items/${rootId}/revoke`, { userId, snapshotAt: snap.snapshotAt, items, boards, grants, terminals, webs });
-      return;
+      return { skippedDocParts: skipped };
     } catch (e: any) {
       if (e?.status !== 409 || attempt === 2) throw e;
     }
   }
+  throw new Error("Rotation impossible");
 }
 
 export function useLibraryCtx(): Ctx {

@@ -1,5 +1,6 @@
 import { WebSocket } from "ws";
 import { agentHooks, sendAgent, terminalMachine, terminalMachineOf } from "./terminals.ts";
+import { isRid } from "./validate.ts";
 
 // File transfers and packet captures ride on a local-shell terminal and are authorised by its
 // key. The server relays blind: it checks that the requester may type in the terminal (editor),
@@ -15,8 +16,6 @@ const MAX_PER_BOARD = 32;
 const IDLE_MS = 90_000;
 /** A client that does not read its socket gets its transfer cancelled past this backlog. */
 const MAX_BUFFERED = 8 * 1024 * 1024;
-
-const RID = /^[A-Za-z0-9_-]{16,64}$/;
 
 type Pending = { ws: WebSocket; boardId: string; term: string; machineId: string; timer: NodeJS.Timeout };
 const pending = new Map<string, Pending>();
@@ -45,7 +44,7 @@ function refuse(ws: WebSocket, rid: unknown, message: string): void {
  * answer (acknowledgements, cancellations): they are relayed without being tracked.
  */
 export function fileRequest(ws: WebSocket, boardId: string, editor: boolean, msg: any): void {
-  if (typeof msg.rid !== "string" || !RID.test(msg.rid)) return refuse(ws, undefined, "Requête invalide");
+  if (!isRid(msg.rid)) return refuse(ws, undefined, "Requête invalide");
   const rid: string = msg.rid;
   if (!editor) return refuse(ws, rid, "Lecture seule : transfert refusé");
   if (typeof msg.term !== "string" || !Number.isSafeInteger(msg.ts) || typeof msg.d !== "string" || msg.d.length === 0 || msg.d.length > MAX_FRAME) {

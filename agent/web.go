@@ -22,13 +22,10 @@ import (
 // point the agent at another host or port since the target is sealed with the key.
 
 const (
-	maxHTTPBody   = 48 << 20
-	httpTimeout   = 60 * time.Second
-	nonceLifetime = inputMaxSkew * 2
+	maxHTTPBody = 48 << 20
+	httpTimeout = 60 * time.Second
 	// maxInflight bounds concurrent forwarded requests per agent (goroutines and buffered bodies).
 	maxInflight = 32
-	// noncePruneEvery spaces out the full scan of the nonce map.
-	noncePruneEvery = 5 * time.Second
 )
 
 type tunnel struct {
@@ -43,7 +40,7 @@ type tunnel struct {
 	transport *http.Transport
 }
 
-var validHostHeader = regexp.MustCompile(`^[A-Za-z0-9.-]{1,253}(:[0-9]{1,5})?$`)
+var validHostHeader = regexp.MustCompile(`^[A-Za-z0-9.-]{1,253}(:[0-9]{1,5})?$`) // mirrors web/src/validators.ts
 
 func hostHeaderOK(h string) bool {
 	if h == "" {
@@ -82,15 +79,14 @@ type webHub struct {
 	mu      sync.Mutex
 	auth    []byte
 	tunnels map[string]*tunnel
-	nonces  map[string]time.Time // request ids seen recently, against replays
-	// lastPrune is when nonces was last scanned for expired entries.
-	lastPrune time.Time
-	inflight  chan struct{}
-	socks     map[string]*wsSock // tunnel id + "/" + socket id
+	// nonces holds the ids of HTTP requests and WebSocket opens seen recently, against replays.
+	nonces   *nonceSet
+	inflight chan struct{}
+	socks    map[string]*wsSock // tunnel id + "/" + socket id
 }
 
 func newWebHub(auth []byte) *webHub {
-	return &webHub{auth: auth, tunnels: map[string]*tunnel{}, nonces: map[string]time.Time{}, inflight: make(chan struct{}, maxInflight), socks: map[string]*wsSock{}}
+	return &webHub{auth: auth, tunnels: map[string]*tunnel{}, nonces: newNonceSet(maxWebNonces), inflight: make(chan struct{}, maxInflight), socks: map[string]*wsSock{}}
 }
 
 // open installs a tunnel from its owner-issued blob:
@@ -172,30 +168,19 @@ var hopHeaders = map[string]bool{
 
 // request handles one encrypted HTTP request; it runs in its own goroutine.
 func (w *webHub) request(msg message, out *outbox) {
-	ts, err := strconv.ParseInt(string(msg.Ts), 10, 64)
-	if err != nil || msg.Rid == "" || len(msg.Rid) > 64 {
+	ts, ok := parseTs(msg.Ts)
+	if !ok || msg.Rid == "" || len(msg.Rid) > 64 {
 		return
 	}
-	if skew := time.Since(time.UnixMilli(ts)); skew > inputMaxSkew || skew < -inputMaxSkew {
+	if !tsInWindow(ts) {
 		debugf("http %s: timestamp out of window", msg.ID)
 		return
 	}
 	nonce := msg.ID + "/" + msg.Rid
-	now := time.Now()
 	w.mu.Lock()
 	t := w.tunnels[msg.ID]
-	// Amortised expiry: a full scan at most once per noncePruneEvery.
-	if now.Sub(w.lastPrune) > noncePruneEvery {
-		w.lastPrune = now
-		for n, at := range w.nonces {
-			if now.Sub(at) > nonceLifetime {
-				delete(w.nonces, n)
-			}
-		}
-	}
-	_, replayed := w.nonces[nonce]
 	w.mu.Unlock()
-	if t == nil || replayed {
+	if t == nil || w.nonces.seen(nonce) {
 		return
 	}
 	data, err := b64.DecodeString(msg.D)
@@ -210,13 +195,7 @@ func (w *webHub) request(msg message, out *outbox) {
 	// Authoritative anti-replay: check and record in one critical section, only once the frame
 	// is authenticated (a forged frame must not burn a nonce). The pre-check above is only an
 	// optimisation, since concurrent identical frames can all pass it.
-	w.mu.Lock()
-	_, replayed = w.nonces[nonce]
-	if !replayed {
-		w.nonces[nonce] = now
-	}
-	w.mu.Unlock()
-	if replayed {
+	if !w.nonces.claim(nonce) {
 		return
 	}
 	select {

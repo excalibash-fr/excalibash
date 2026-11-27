@@ -32,8 +32,8 @@ var (
 	errTarget  = errors.New("cible distante invalide")
 	errAborted = errors.New("saisie annulée")
 
-	targetHost = regexp.MustCompile(`^[A-Za-z0-9._:-]{1,253}$`)
-	targetUser = regexp.MustCompile(`^[A-Za-z0-9._@\-]{0,64}$`)
+	targetHost = regexp.MustCompile(`^[A-Za-z0-9._:-]{1,253}$`) // mirrors web/src/validators.ts
+	targetUser = regexp.MustCompile(`^[A-Za-z0-9._@\-]{0,64}$`) // mirrors web/src/validators.ts
 )
 
 type target struct {

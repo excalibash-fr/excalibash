@@ -8,12 +8,11 @@ import type { Duplex } from "node:stream";
 import { WebSocketServer } from "ws";
 import { attachTunnelSocket, relay, tunnelExists } from "./tunnels.ts";
 import { certificatePem, serve, type Listener } from "./tls.ts";
+import { isClientId } from "./validate.ts";
 
 // Second origin for web tunnels. Tunnelled sites run here, isolated from Excalibash's own origin
 // (its storage holds the account keys). This server only hands out the boot page and service
 // worker, and relays encrypted frames; it holds no session and decrypts nothing.
-
-const ID = /^[A-Za-z0-9_-]{16,43}$/;
 
 /** Excalibash's own origin, the only one allowed to hand tunnel keys to this origin. */
 export function mainOrigin(req: Request): string {
@@ -76,7 +75,7 @@ function tunnelGuard(req: Request, res: express.Response, next: express.NextFunc
     res.status(429).json({ error: "trop de requêtes" });
     return;
   }
-  if (!ID.test(id) || !tunnelExists(id)) {
+  if (!isClientId(id) || !tunnelExists(id)) {
     res.status(404).json({ error: "tunnel inconnu" });
     return;
   }
@@ -130,7 +129,7 @@ function upgrade(req: IncomingMessage, socket: Duplex, head: Buffer): void {
     socket.end(`HTTP/1.1 ${code} ${text}\r\nConnection: close\r\n\r\n`);
   };
   const m = new URL(req.url ?? "/", "http://x").pathname.match(/^\/eb-proxy\/ws\/([^/]+)$/);
-  if (!m || !ID.test(m[1]!)) return reject(404, "Not Found");
+  if (!m || !isClientId(m[1])) return reject(404, "Not Found");
   // Only pages of this very origin (the shim) may open one; a foreign page has no key anyway.
   const origin = req.headers.origin;
   try {

@@ -17,7 +17,7 @@ import type * as Y from "yjs";
 import type { KernelEvent } from "./kernelProtocol.ts";
 import { ExecRunner, type AwarenessLike, type RunResult } from "./execRunner.ts";
 import type { KernelStatus, TermPort } from "./kernelSession.ts";
-import { applyKernelEvents, beginRun, cellViews, findCell, finishRun, type WriteState } from "./notebookDoc.ts";
+import { applyKernelEvents, beginRun, cellViews, findCell, finishRun, resetRunOutputs, type WriteState } from "./notebookDoc.ts";
 
 export type { AwarenessLike, KernelStatus, RunResult, TermPort };
 
@@ -37,6 +37,9 @@ export class NotebookRunner extends ExecRunner {
   }
   protected finishOrphan(execId: string, count: number | null | undefined) {
     finishRun(this.ydoc, execId, count);
+  }
+  protected resetOutputs(cellId: string, execId: string) {
+    resetRunOutputs(this.ydoc, cellId, execId);
   }
 
   /** Runs a cell on the shared kernel; this client becomes its executor. */

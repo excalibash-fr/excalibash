@@ -38,7 +38,7 @@ const NotebookEmbed = lazy(() => import("../board/NotebookEmbed.tsx"));
 import { WindowDock, type DockGroup } from "../board/WindowDock.tsx";
 import { capturesOf } from "../board/captureManager.ts";
 import { CaptureDock } from "../board/CapturePanel.tsx";
-import { saveBlob } from "../board/termTools.ts";
+import { saveBlob } from "../download.ts";
 import { cableEnds, cableOf, finishCable, maintainCables, setCableEnd, type End } from "../board/cables.ts";
 import { FileClient } from "../board/fileTransfer.ts";
 import { CableEndForm, CableOverlay, type CableMark } from "../board/CableOverlay.tsx";
@@ -50,7 +50,8 @@ import { planSchemaCheck, runSchemaCheck } from "../board/schemaRun.ts";
 import { OutdatedError, supports } from "../agentCaps.ts";
 import { reportOutdated } from "../outdatedBus.ts";
 import { exportDiagram, exportTopology, type TopologyFormat } from "../board/exportDiagram.ts";
-import { FormFrame, HOST_RE, MachineField, RemoteForm, useMachineChoice } from "../board/RemoteForm.tsx";
+import { FormFrame, MachineField, RemoteForm, useMachineChoice } from "../board/RemoteForm.tsx";
+import { HOST_HEADER_RE, HOST_RE, stripBrackets } from "../validators.ts";
 import type { RemoteHop, RemoteTarget } from "../api.ts";
 
 /** A device's target as a jump host, to bounce through it (its options carried over). */
@@ -99,6 +100,7 @@ import {
   migrateLegacyTerminals,
   type RemoteRef,
 } from "../board/nodes.ts";
+import { readStorage, writeStorage } from "../storage.ts";
 
 const TILE = 120;
 /** Height of the terminal's title bar, in scene units (the window is scaled with the zoom). */
@@ -464,7 +466,7 @@ function Editor({ node }: { node: Node }) {
       try {
         const info = await session.createTerminal(machine, 100, 30, target);
         linkMachine({ id: session.boardId, key: session.key }, machine).catch(() => {});
-        localStorage.setItem(LAST_MACHINE, machine.id);
+        writeStorage(LAST_MACHINE, machine.id);
         const near = nodeId ? findEl(x, nodeId) : undefined;
         const owner = near && !near.isDeleted ? near : undefined;
         if (target) {
@@ -598,7 +600,7 @@ function Editor({ node }: { node: Node }) {
       if (!e.altKey || e.code !== "KeyT" || e.ctrlKey || e.metaKey) return;
       e.preventDefault();
       e.stopPropagation();
-      const last = localStorage.getItem(LAST_MACHINE);
+      const last = readStorage(LAST_MACHINE);
       const m = (await listMachines(keys)).find((x) => x.id === last && x.online);
       if (m) newShell(m);
       else if (termButton.current) setPicker({ anchor: termButton.current });
@@ -1626,7 +1628,7 @@ function Editor({ node }: { node: Node }) {
               defaultHost={access.bounce ? "" : device?.target.host}
               defaultVia={access.bounce && [...(access.bounce.target.via ?? []), hopFrom(access.bounce.target)]}
               defaultMachineId={
-                (access.bounce ?? access.device)?.machineId || (access.nodeId && nodeMachineId(access.nodeId)) || localStorage.getItem(LAST_MACHINE)
+                (access.bounce ?? access.device)?.machineId || (access.nodeId && nodeMachineId(access.nodeId)) || readStorage(LAST_MACHINE)
               }
               onClose={() => setAccess(null)}
               onCreate={(machine, target) => {
@@ -1644,7 +1646,7 @@ function Editor({ node }: { node: Node }) {
               <WebForm
                 bare
                 defaultHost={device?.target.host}
-                defaultMachineId={nodeMachineId(nodeId) ?? localStorage.getItem(LAST_MACHINE)}
+                defaultMachineId={nodeMachineId(nodeId) ?? readStorage(LAST_MACHINE)}
                 onClose={() => setAccess(null)}
                 onCreate={async (machine, target) => {
                   const x = excalidrawRef.current;
@@ -1817,7 +1819,7 @@ function MachinePicker({ anchor, onClose, onPick, onRemote }: { anchor: MenuAnch
   useEffect(() => {
     listMachines(keys).then(setMachines).catch(toast.error);
   }, [keys]);
-  const last = localStorage.getItem(LAST_MACHINE);
+  const last = readStorage(LAST_MACHINE);
   return (
     <Menu anchor={anchor} onClose={onClose} align="right">
       <div className="menu-label">Ouvrir un terminal sur…</div>
@@ -2086,9 +2088,9 @@ function WebForm({
   const [hostHeader, setHostHeader] = useState("");
   const [legacyTls, setLegacyTls] = useState(false);
   const machine = choice.machine;
-  const cleanHost = host.trim().replace(/^\[|\]$/g, "");
+  const cleanHost = stripBrackets(host.trim());
   const cleanHeader = hostHeader.trim();
-  const headerOk = !cleanHeader || /^[A-Za-z0-9.-]{1,253}(:[0-9]{1,5})?$/.test(cleanHeader);
+  const headerOk = !cleanHeader || HOST_HEADER_RE.test(cleanHeader);
   const portNum = Number(port);
   const valid = !!machine && HOST_RE.test(cleanHost) && Number.isInteger(portNum) && portNum > 0 && portNum < 65536 && headerOk;
   const url = `${scheme}://${cleanHost.includes(":") ? `[${cleanHost}]` : cleanHost}:${port}${path.startsWith("/") ? path : `/${path}`}`;
