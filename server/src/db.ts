@@ -202,6 +202,20 @@ addColumn("users", "findable_name", "INTEGER NOT NULL DEFAULT 1");
 addColumn("users", "findable_email", "INTEGER NOT NULL DEFAULT 0");
 addColumn("users", "notify", "TEXT NOT NULL DEFAULT '{}'"); // email notifications, all off by default
 
+// Second factor (TOTP). The secrets are sealed with a key derived from server_secret (see mfa.ts); the backup codes
+// are stored as hashes. totp_last_step is the last accepted time step (a code works once).
+addColumn("users", "totp_secret", "TEXT");
+addColumn("users", "totp_enabled", "INTEGER NOT NULL DEFAULT 0");
+addColumn("users", "totp_last_step", "INTEGER NOT NULL DEFAULT 0");
+addColumn("users", "totp_pending", "TEXT"); // secret being activated, not valid for logins yet
+db.exec(`
+CREATE TABLE IF NOT EXISTS mfa_backup_codes (
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  code_hash TEXT NOT NULL,
+  PRIMARY KEY (user_id, code_hash)
+);
+`);
+
 // Active sessions: coarse connection metadata only (never the raw User-Agent or full IP).
 addColumn("sessions", "public_id", "TEXT"); // opaque id shown to the owner, distinct from the token hash
 db.exec("UPDATE sessions SET public_id = lower(hex(randomblob(8))) WHERE public_id IS NULL");

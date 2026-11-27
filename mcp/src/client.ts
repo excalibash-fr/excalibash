@@ -52,13 +52,20 @@ export function normalizeUrl(input: string): string {
  * Same flow as the web app's login: prelogin, derive the keys locally, authenticate with the
  * authKey only, open the private key, and refuse a public key the server made up.
  */
-export async function login(url: string, email: string, password: string): Promise<McpConfig> {
+export async function login(url: string, email: string, password: string, askCode?: () => Promise<string>): Promise<McpConfig> {
   useServer(url);
   const { salt } = await api.post<{ salt: string }>("/auth/prelogin", { email });
   const { authKey, masterKey } = await deriveAccountKeys(password, salt);
-  let r: { user: User; keys: { publicKey: string; encPrivateKey: string } };
+  let r: { user: User; keys: { publicKey: string; encPrivateKey: string }; mfaRequired?: boolean; mfaToken?: string };
   try {
     r = await api.post("/auth/login", { email, authKey });
+    // Second factor: no session and no keys until the code is given.
+    if (r.mfaRequired) {
+      if (!askCode) throw new Error("Ce compte a la double authentification : le code est nécessaire.");
+      const code = (await askCode()).trim();
+      if (!code) throw new Error("Code à deux facteurs manquant.");
+      r = await api.post("/auth/mfa", { mfaToken: r.mfaToken, code });
+    }
   } catch (e) {
     if (e instanceof ApiError && e.code === "EMAIL_NOT_VERIFIED") {
       throw new Error(`L'email de ${email} n'est pas encore vérifié : termine la vérification dans le navigateur (${url}), puis relance « login ».`);

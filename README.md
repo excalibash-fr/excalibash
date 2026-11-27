@@ -70,6 +70,8 @@ La clé de récupération affichée à l'inscription est le seul moyen de retrou
 
 Les inscriptions sont fermées par défaut. Elles s'ouvrent dans **Administration → Inscriptions ouvertes à tous** ; sinon, l'administrateur crée des liens d'invitation.
 
+**Double authentification (TOTP)** : chaque compte peut l'activer dans **Mon compte → Double authentification** (application d'authentification, 10 codes de secours). Un administrateur peut la rendre obligatoire pour les administrateurs (**Administration → Sécurité**) et réinitialiser celle d'un utilisateur qui a perdu son appareil. Détails et limites : [docs/SECURITY.md](docs/SECURITY.md).
+
 ## Configuration
 
 Les variables se placent dans un fichier `.env` à côté de `docker-compose.yml` (ignoré par git).

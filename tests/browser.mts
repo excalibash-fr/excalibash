@@ -4,6 +4,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { base32Decode, totp as totpAt } from "../server/src/totp.ts";
 import { chromium, type Browser, type BrowserContext, type Page } from "../web/node_modules/playwright-core/index.mjs";
 
 const BASE = process.env.BASE ?? "http://127.0.0.1:6797";
@@ -194,6 +195,94 @@ try {
   const after = await until("thème changé", () => A.page.evaluate((b) => document.documentElement.classList.contains("dark") !== b, before));
   ok(after, "le bouton de thème bascule clair / sombre");
   await noConsoleErrors("tableau de bord et tableau : aucune erreur console");
+
+  // ---- 2b. Second factor ----
+  block("2b. Double authentification (activation, connexion avec code, code de secours, désactivation)");
+  {
+    const pg = B.page;
+    await pg.goto("/account");
+    const panel = pg.locator(".panel", { has: pg.getByRole("heading", { name: "Double authentification" }) });
+    await panel.getByRole("button", { name: "Activer", exact: true }).click();
+    await panel.getByLabel("Mot de passe").fill("bob-password-1");
+    await panel.getByRole("button", { name: "Continuer" }).click();
+    const secretBox = panel.getByTestId("mfa-secret");
+    await secretBox.waitFor();
+    const secret = (await secretBox.innerText()).replace(/\s/g, "");
+    ok(/^[A-Z2-7]{32}$/.test(secret), "activation : le secret est affiché en clair (base32), copiable");
+    const qr = panel.locator("svg[role=img]");
+    ok((await qr.isVisible()) && (await qr.locator("path").getAttribute("d"))!.length > 500, "activation : un QR code est dessiné localement (SVG)");
+    await shot("mfa-qr");
+    await panel.getByLabel("Code à 6 chiffres").fill("000000");
+    await panel.getByRole("button", { name: "Activer", exact: true }).click();
+    await pg.locator(".toast", { hasText: "Code incorrect" }).first().waitFor();
+    ok(true, "activation : un mauvais code est refusé (« Code incorrect »)");
+    await panel.getByLabel("Code à 6 chiffres").fill(totpAt(base32Decode(secret)!, Date.now()));
+    await panel.getByRole("button", { name: "Activer", exact: true }).click();
+    const boxCodes = panel.getByTestId("mfa-backup-codes");
+    await boxCodes.waitFor();
+    const codes = (await boxCodes.innerText()).match(/[2-9A-Z]{5}-[2-9A-Z]{5}/g) ?? [];
+    ok(codes.length === 10 && new Set(codes).size === 10, "activation : les 10 codes de secours sont affichés");
+    ok(await panel.getByRole("button", { name: "Terminé" }).isDisabled(), "activation : « Terminé » attend la confirmation que les codes sont rangés");
+    await shot("mfa-codes");
+    await panel.getByLabel(/Je les ai rangés/).check();
+    await panel.getByRole("button", { name: "Terminé" }).click();
+    await panel.getByText("activée", { exact: true }).waitFor();
+    ok(/Codes de secours restants : 10/.test(await panel.innerText()), "la section indique « activée » et 10 codes de secours restants");
+    await noConsoleErrors("activation du MFA : aucune erreur console");
+
+    // A fresh browser: password, then the code.
+    const B2 = await newUser("bob-mfa");
+    await loginUI(B2.page, "bob@test.local", "bob-password-1");
+    await B2.page.getByRole("heading", { name: "Code de vérification" }).waitFor();
+    ok((await B2.page.getByLabel("Code", { exact: true }).getAttribute("autocomplete")) === "one-time-code", "connexion : l'étape « Code de vérification » suit le mot de passe (autocomplete one-time-code)");
+    ok((await api(B2.page, "GET", "/auth/me")).status === 401, "connexion : pas de session avant le code");
+    await B2.page.getByLabel("Code", { exact: true }).fill("123456");
+    await B2.page.getByRole("button", { name: "Valider" }).click();
+    await B2.page.getByText("Code incorrect").waitFor();
+    ok(true, "connexion : mauvais code → « Code incorrect »");
+    // The step after the one used to enable (±1 step is accepted).
+    await B2.page.getByLabel("Code", { exact: true }).fill(totpAt(base32Decode(secret)!, Date.now() + 30_000));
+    await B2.page.getByRole("button", { name: "Valider" }).click();
+    await B2.page.getByText("Une page blanche…").waitFor();
+    ok((await api(B2.page, "GET", "/auth/me")).body.user?.mfaEnabled === true, "connexion : bon code → session ouverte, tableau de bord");
+    await B2.ctx.close();
+    pages.delete("bob-mfa");
+
+    // Backup code from the link.
+    const B3 = await newUser("bob-mfa-backup");
+    await loginUI(B3.page, "bob@test.local", "bob-password-1");
+    await B3.page.getByRole("button", { name: "Utiliser un code de secours" }).click();
+    await B3.page.getByLabel("Code de secours").fill(codes[0]);
+    await B3.page.getByRole("button", { name: "Valider" }).click();
+    await B3.page.getByText("Une page blanche…").waitFor();
+    ok(true, "connexion : un code de secours ouvre la session");
+    await B3.ctx.close();
+    pages.delete("bob-mfa-backup");
+    const reuse = await newUser("bob-mfa-reuse");
+    await loginUI(reuse.page, "bob@test.local", "bob-password-1");
+    await reuse.page.getByRole("button", { name: "Utiliser un code de secours" }).click();
+    await reuse.page.getByLabel("Code de secours").fill(codes[0]);
+    await reuse.page.getByRole("button", { name: "Valider" }).click();
+    await reuse.page.getByText("Code incorrect").waitFor();
+    ok(true, "connexion : le même code de secours ne marche qu'une fois");
+    await reuse.ctx.close();
+    pages.delete("bob-mfa-reuse");
+
+    // The administration lists the state; the switch is there.
+    await A.page.goto("/admin");
+    await A.page.getByText("MFA obligatoire pour les administrateurs").waitFor();
+    ok((await A.page.locator(".admin-user", { hasText: "Bob" }).getByText("MFA", { exact: true }).count()) === 1, "administration : le MFA de Bob est signalé dans la liste, le réglage « obligatoire » est proposé");
+    await noConsoleErrors("connexions avec code : aucune erreur console");
+
+    // Turn it off again with a backup code (the rest of the suite signs Bob in with a password only).
+    await pg.goto("/account");
+    await panel.getByRole("button", { name: "Désactiver" }).click();
+    await panel.getByLabel("Mot de passe").fill("bob-password-1");
+    await panel.getByLabel(/Code à 6 chiffres/).fill(codes[1]);
+    await panel.getByRole("button", { name: "Désactiver" }).click();
+    await panel.getByRole("button", { name: "Activer", exact: true }).waitFor();
+    ok((await api(pg, "GET", "/account")).body.mfa.enabled === false, "désactivation : mot de passe + code de secours, la section revient à « Activer »");
+  }
 
   // ---- 3. Machine ----
   block("3. Machine appairée par code");

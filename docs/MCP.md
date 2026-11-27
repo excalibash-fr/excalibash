@@ -42,7 +42,9 @@ node excalibash-mcp.mjs login
 
 `login` demande l'adresse de l'instance, l'email et le mot de passe (saisi sans écho). Pour un script ou
 une CI : `EXCALIBASH_URL`, `EXCALIBASH_EMAIL` et `EXCALIBASH_PASSWORD`. Si l'email n'est pas encore vérifié,
-termine la vérification dans le navigateur puis relance `login`.
+termine la vérification dans le navigateur puis relance `login`. Si le compte a la double authentification,
+`login` demande aussi « Code à deux facteurs » (un code de l'application ou un code de secours) ; en mode non
+interactif, donne-le dans `EXCALIBASH_TOTP`. Un code ne sert qu'une fois : il faut en attendre un nouveau pour chaque connexion.
 
 **Instance au certificat auto-signé** : télécharge `https://<instance>/certificate.pem`, vérifie son
 empreinte comme pour le navigateur, puis lance les commandes avec `NODE_EXTRA_CA_CERTS=/chemin/certificate.pem`.

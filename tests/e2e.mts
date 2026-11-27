@@ -257,6 +257,30 @@ const bob = await register("bob@test.local", "Bob", "bob-password-12");
   ok(good.status === 200 && good.body.user?.email === dave && !!jar.current, "bon code accepté : session ouverte");
   const after = await api("POST", "/auth/login", { email: dave, authKey: b64 });
   ok(after.status === 200, "connexion possible après vérification");
+
+  // Brute force: 10 failures lock the account 15 minutes, even for the right password; an unknown email is locked
+  // and answers just the same. The per-minute limits (8 per email, 20 per address) come first and answer "dans une
+  // minute": on those, wait for the next minute and go on, so only real failures (401) are counted.
+  const unknownEmail = "fantome@test.local";
+  const wrongLogin = (email: string) => api("POST", "/auth/login", { email, authKey: "Z".repeat(16) });
+  const fail10 = async (email: string) => {
+    for (let n = 0; n < 10; ) {
+      const r = await wrongLogin(email);
+      if (r.status === 401) n++;
+      else if (/une minute/.test(r.body.error)) await new Promise((res) => setTimeout(res, 61_000));
+      else return r;
+    }
+    return undefined;
+  };
+  const stray = await Promise.all([fail10(dave), fail10(unknownEmail)]);
+  ok(stray.every((r) => !r), "10 mauvais mots de passe : tous refusés en 401 (existant ou non)");
+  const lockedReal = await api("POST", "/auth/login", { email: dave, authKey: b64 });
+  const lockedGhost = await api("POST", "/auth/login", { email: unknownEmail, authKey: b64 });
+  ok(lockedReal.status === 429 && /plus tard/.test(lockedReal.body.error), "11e tentative avec le BON mot de passe : compte verrouillé (429)");
+  ok(lockedGhost.status === 429 && JSON.stringify(lockedGhost.body) === JSON.stringify(lockedReal.body), "email inexistant : même verrou, même réponse");
+  const security = readFileSync(`${dirname(DB)}/server.log`, "utf8").split("\n").filter((l) => l.startsWith("excalibash-security "));
+  ok(security.filter((l) => l.includes("event=account_locked scope=login")).length >= 2, "journal : excalibash-security event=account_locked pour les deux comptes");
+  ok(security.some((l) => l.includes("event=auth_failed scope=login ip=")) && !security.some((l) => l.includes("@")), "journal : auth_failed avec l'IP, jamais d'email");
 }
 await as(alice, () => api("PATCH", "/admin/settings", { registrationOpen: false }));
 // Findable by name (default) and by email (off by default); a hidden account answers like a missing one.
@@ -2132,6 +2156,264 @@ if (process.env.UPDATE_V1_BIN && process.env.UPDATE_SIGN && process.env.UPDATE_K
     hB3.close();
   }
   ok(errors.length === 0, `documents : aucune erreur côté client${errors.length ? ` (${errors.join("; ")})` : ""}`);
+}
+
+// Second factor (TOTP): enrolment, login, recovery, backup codes, brute force, MFA required for admins, reset by an admin.
+{
+  const { totp: totpAt, base32Decode } = await import("../server/src/totp.ts");
+  const logLines = () => readFileSync(`${dirname(DB)}/server.log`, "utf8").split("\n");
+  // The per-minute limits (login, recover) answer "dans une minute": wait for the next minute and go on.
+  const patient = async <T extends { status: number; body: any }>(fn: () => Promise<T>): Promise<T> => {
+    for (;;) {
+      const r = await fn();
+      if (r.status === 429 && /une minute/.test(r.body.error ?? "")) await new Promise((res) => setTimeout(res, 61_000));
+      else return r;
+    }
+  };
+  const sessionsOf = (id: string) => (rw.prepare("SELECT COUNT(*) AS n FROM sessions WHERE user_id = ?").get(id) as any).n as number;
+  const lastStepReset = (id: string) => rw.prepare("UPDATE users SET totp_last_step = 0 WHERE id = ?").run(id);
+  /** A current code for this secret; the replay memory is cleared first (a code could otherwise be used only once per 30 s). */
+  const fresh = (secret: string, id: string) => (lastStepReset(id), totpAt(base32Decode(secret)!, Date.now()));
+  const loginStep1 = async (email: string, password: string) => {
+    jar.current = "";
+    const { body: pre } = await api("POST", "/auth/prelogin", { email });
+    const { authKey } = await c.deriveAccountKeys(password, pre.salt);
+    return patient(() => api("POST", "/auth/login", { email, authKey }));
+  };
+  const asCookie = (cookie: string) => ({ cookie }) as U;
+  const invite = async () => new URL((await as(alice, () => api("POST", "/admin/invites", { note: "mfa" }))).body.url).searchParams.get("invite")!;
+
+  // Two accounts: Maxine (will be admin) and Nolan (plain user).
+  let maxine = await register("maxine@test.local", "Maxine", "maxine-password-1", await invite());
+  const nolan = await register("nolan@test.local", "Nolan", "nolan-password-1", await invite());
+  await as(alice, () => api("PATCH", `/admin/users/${maxine.user.id}`, { isAdmin: true }));
+  let maxPw = "maxine-password-1";
+  const relog = async (u: U, password: string) => {
+    const r = await loginStep1(u.user.email, password);
+    return { ...u, cookie: jar.current, r };
+  };
+  maxine = (await relog(maxine, maxPw)) as U;
+  const authKeyOf = async (u: U, password: string) => {
+    const { body: pre } = await api("POST", "/auth/prelogin", { email: u.user.email });
+    return (await c.deriveAccountKeys(password, pre.salt)).authKey;
+  };
+  const authMax = await authKeyOf(maxine, maxPw);
+  const authNol = await authKeyOf(nolan, "nolan-password-1");
+
+  ok((await as(maxine, () => api("GET", "/auth/me"))).body.user.mfaEnabled === false, "MFA : désactivée par défaut (me.mfaEnabled)");
+  jar.current = "";
+  ok((await api("POST", "/account/mfa/setup", { authKey: authMax })).status === 401, "MFA : activation réservée aux comptes connectés");
+  ok((await as(maxine, () => api("POST", "/account/mfa/setup", { authKey: authNol }))).status === 403, "MFA : activation refusée avec un mauvais mot de passe");
+  ok((await as(maxine, () => api("POST", "/account/mfa/enable", { code: "123456" }))).status === 400, "MFA : « enable » sans « setup » refusé");
+
+  // ---- Enrolment (Maxine) ----
+  const setup = (await as(maxine, () => api("POST", "/account/mfa/setup", { authKey: authMax }))).body;
+  ok(/^[A-Z2-7]{32}$/.test(setup.secret ?? "") && setup.uri === `otpauth://totp/Excalibash:maxine%40test.local?secret=${setup.secret}&issuer=Excalibash&algorithm=SHA1&digits=6&period=30`, "MFA : « setup » renvoie le secret (base32) et l'URI otpauth");
+  const enabledEarly = await as(maxine, () => api("GET", "/auth/me"));
+  ok(enabledEarly.body.user.mfaEnabled === false, "MFA : pas active tant que le premier code n'est pas donné");
+  const wrongEnable = await as(maxine, () => api("POST", "/account/mfa/enable", { code: "000000" }));
+  ok(wrongEnable.status === 401 && wrongEnable.body.error === "Code incorrect", "MFA : mauvais premier code refusé");
+  const en = await as(maxine, () => api("POST", "/account/mfa/enable", { code: fresh(setup.secret, maxine.user.id) }));
+  let maxCodes: string[] = en.body.backupCodes ?? [];
+  ok(en.status === 200 && maxCodes.length === 10 && new Set(maxCodes).size === 10 && maxCodes.every((x) => /^[2-9A-HJKMNP-Z]{5}-[2-9A-HJKMNP-Z]{5}$/.test(x)), "MFA : bon code → activée, 10 codes de secours (XXXXX-XXXXX)");
+  ok((await as(maxine, () => api("GET", "/auth/me"))).body.user.mfaEnabled === true, "MFA : me.mfaEnabled passe à true");
+  ok((await as(maxine, () => api("POST", "/account/mfa/setup", { authKey: authMax }))).status === 400, "MFA : déjà activée → « setup » refusé");
+  const acc = (await as(maxine, () => api("GET", "/account"))).body.mfa;
+  ok(acc.enabled === true && acc.backupCodesLeft === 10 && !JSON.stringify(acc).includes(setup.secret), "MFA : /account indique l'état et les codes restants, jamais le secret");
+  const stored = rw.prepare("SELECT totp_secret, totp_pending FROM users WHERE id = ?").get(maxine.user.id) as any;
+  const bcRows = JSON.stringify(rw.prepare("SELECT * FROM mfa_backup_codes WHERE user_id = ?").all(maxine.user.id));
+  ok(/^v1\./.test(stored.totp_secret) && !JSON.stringify(stored).includes(setup.secret) && stored.totp_pending === null, "MFA : secret chiffré au repos (AES-GCM), pas de secret en attente");
+  ok(!maxCodes.some((x) => bcRows.includes(x) || bcRows.includes(x.replace("-", ""))), "MFA : codes de secours stockés hachés, pas en clair");
+  ok(logLines().some((l) => l.includes(`event=mfa_enabled account=${maxine.user.id}`)), "journal : mfa_enabled");
+
+  // ---- Login ----
+  const sessionsBefore = sessionsOf(maxine.user.id);
+  const l1 = await loginStep1("maxine@test.local", maxPw);
+  ok(l1.status === 200 && l1.body.mfaRequired === true && typeof l1.body.mfaToken === "string" && l1.body.mfaToken.length >= 43, "login : mot de passe juste + MFA → mfaRequired et un jeton");
+  ok(!l1.body.user && !l1.body.keys && jar.current === "" && sessionsOf(maxine.user.id) === sessionsBefore, "login : ni session, ni cookie, ni clés avant le code");
+  const tokenA = l1.body.mfaToken;
+  const noCode = await api("GET", "/auth/me");
+  ok(noCode.status === 401, "login : le jeton n'ouvre aucun accès");
+  const badTok = await api("POST", "/auth/mfa", { mfaToken: "x".repeat(43), code: fresh(setup.secret, maxine.user.id) });
+  const wrong1 = await api("POST", "/auth/mfa", { mfaToken: tokenA, code: "000000" });
+  const wrongBackup = await api("POST", "/auth/mfa", { mfaToken: tokenA, code: "ZZZZZ-ZZZZZ" });
+  ok(wrong1.status === 401 && wrong1.body.error === "Code incorrect" && jar.current === "", "mfa : mauvais code TOTP → 401 « Code incorrect », sans cookie");
+  ok(JSON.stringify(wrongBackup.body) === JSON.stringify(wrong1.body) && wrongBackup.status === 401, "mfa : mauvais code de secours → même réponse");
+  ok(badTok.status === 401 && JSON.stringify(badTok.body) === JSON.stringify(wrong1.body), "mfa : jeton inconnu ou périmé → même réponse");
+  const goodCode = fresh(setup.secret, maxine.user.id);
+  const l2 = await api("POST", "/auth/mfa", { mfaToken: tokenA, code: goodCode });
+  ok(l2.status === 200 && l2.body.user?.id === maxine.user.id && l2.body.keys?.encPrivateKey && jar.current.length > 0, "mfa : bon code → session, utilisateur et clés");
+  maxine = { ...maxine, cookie: jar.current };
+  ok((await as(maxine, () => api("GET", "/auth/me"))).status === 200, "mfa : la session ouverte fonctionne");
+  ok((await api("POST", "/auth/mfa", { mfaToken: tokenA, code: totpAt(base32Decode(setup.secret)!, Date.now() + 30_000) })).status === 401, "mfa : un jeton réussi ne sert qu'une fois");
+  // Replay: the same code, with a new token, is refused.
+  const l3 = await loginStep1("maxine@test.local", maxPw);
+  const replay = await api("POST", "/auth/mfa", { mfaToken: l3.body.mfaToken, code: goodCode });
+  ok(replay.status === 401 && jar.current === "", "mfa : rejeu du même code refusé");
+  // The next step is fine (±1 window), once.
+  const nextCode = totpAt(base32Decode(setup.secret)!, Date.now() + 30_000);
+  const nextOk = await api("POST", "/auth/mfa", { mfaToken: l3.body.mfaToken, code: nextCode });
+  ok(nextOk.status === 200, "mfa : le pas suivant est accepté (fenêtre ±1)");
+  const l3b = await loginStep1("maxine@test.local", maxPw);
+  ok((await api("POST", "/auth/mfa", { mfaToken: l3b.body.mfaToken, code: nextCode })).status === 401, "mfa : ...mais pas deux fois");
+  // 5 wrong codes destroy the token, even for the right code after.
+  const l4 = await loginStep1("maxine@test.local", maxPw);
+  for (let i = 0; i < 5; i++) await api("POST", "/auth/mfa", { mfaToken: l4.body.mfaToken, code: "111111" });
+  const afterFive = await api("POST", "/auth/mfa", { mfaToken: l4.body.mfaToken, code: fresh(setup.secret, maxine.user.id) });
+  ok(afterFive.status === 401 && jar.current === "", "mfa : au 5e mauvais code le jeton est détruit (même le bon code échoue ensuite)");
+
+  // ---- Backup codes ----
+  const useBackup = async (code: string) => {
+    const t = await loginStep1("maxine@test.local", maxPw);
+    return api("POST", "/auth/mfa", { mfaToken: t.body.mfaToken, code });
+  };
+  const b1 = await useBackup(maxCodes[0]);
+  ok(b1.status === 200 && b1.body.user?.id === maxine.user.id, "code de secours : accepté");
+  ok((await useBackup(maxCodes[0])).status === 401, "code de secours : refusé la deuxième fois");
+  const b2 = await useBackup(maxCodes[1].toLowerCase().replace("-", " "));
+  ok(b2.status === 200, "code de secours : casse, tiret et espaces tolérés");
+  ok((await as(maxine, () => api("GET", "/account"))).body.mfa.backupCodesLeft === 8, "code de secours : 8 restants");
+  ok(logLines().some((l) => l.includes(`event=mfa_backup_used account=${maxine.user.id} remaining=9`)) && logLines().some((l) => l.includes(`event=mfa_backup_used account=${maxine.user.id} remaining=8`)), "journal : mfa_backup_used avec le nombre restant");
+
+  // Regenerate (needs a current code); the old ones stop working.
+  ok((await as(maxine, () => api("POST", "/account/mfa/backup-codes", { code: "000000" }))).status === 401, "régénération : mauvais code refusé");
+  const regen = await as(maxine, () => api("POST", "/account/mfa/backup-codes", { code: fresh(setup.secret, maxine.user.id) }));
+  const oldCodes = maxCodes;
+  maxCodes = regen.body.backupCodes ?? [];
+  ok(regen.status === 200 && maxCodes.length === 10 && maxCodes.every((x) => !oldCodes.includes(x)), "régénération : 10 nouveaux codes");
+  ok((await useBackup(oldCodes[2])).status === 401, "régénération : un ancien code ne marche plus");
+  ok((await useBackup(maxCodes[0])).status === 200, "régénération : un nouveau code marche");
+  ok((await as(nolan, () => api("POST", "/account/mfa/backup-codes", { code: "123456" }))).status === 400, "régénération : refusée sans MFA");
+
+  // ---- Recovery needs the second factor too ----
+  {
+    const rec = await c.recoveryKeys(c.parseRecoveryKey(maxine.recovery));
+    jar.current = "";
+    const recover1 = (mfaCode?: string) => patient(() => api("POST", "/auth/recover", { email: "maxine@test.local", recoveryAuth: rec.recoveryAuth, mfaCode }));
+    const step0 = await recover1();
+    ok(step0.status === 200 && step0.body.mfaRequired === true && jar.current === "", "récupération : étape 1 sans code annonce mfaRequired");
+    ok(!("recoveryEncPrivateKey" in step0.body) && !("userId" in step0.body) && !("publicKey" in step0.body) && !JSON.stringify(step0.body).includes(maxine.user.id), "récupération : étape 1 sans code ne livre ni clé chiffrée, ni identifiant, ni clé publique");
+    const w1 = await recover1("000000");
+    ok(w1.status === 401 && w1.body.error === "Code incorrect" && !("recoveryEncPrivateKey" in w1.body), "récupération : étape 1 avec un mauvais code → 401 « Code incorrect »");
+    const step1 = await recover1(maxCodes[1]);
+    ok(step1.status === 200 && !!step1.body.recoveryEncPrivateKey && typeof step1.body.mfaToken === "string", "récupération : étape 1 avec un code de secours livre la clé chiffrée et un jeton");
+    const pkcs8 = await c.unbox(rec.recoveryEnc, step1.body.recoveryEncPrivateKey, c.AAD.priv(maxine.user.id));
+    const newPw = "maxine-nouveau-mdp-1";
+    const salt = c.toB64(c.randomBytes(16));
+    const nk = await c.deriveAccountKeys(newPw, salt);
+    const finish = async (mfaToken?: string) =>
+      patient(async () =>
+        api("POST", "/auth/recover/finish", { email: "maxine@test.local", recoveryAuth: rec.recoveryAuth, mfaToken, salt, authKey: nk.authKey, encPrivateKey: await c.box(nk.masterKey, pkcs8, c.AAD.priv(maxine.user.id)) }),
+      );
+    const f0 = await finish();
+    ok(f0.status === 401 && f0.body.error === "Code incorrect" && jar.current === "", "récupération : étape 2 sans jeton refusée (la clé ne suffit pas)");
+    const lt = await loginStep1("maxine@test.local", maxPw);
+    const f1 = await finish(lt.body.mfaToken);
+    ok(f1.status === 401 && JSON.stringify(f1.body) === JSON.stringify(f0.body), "récupération : étape 2 avec un jeton de connexion refusée");
+    const other = await recover1(); // no code: nothing to take from here
+    const f1b = await finish("x".repeat(43));
+    ok(other.status === 200 && f1b.status === 401, "récupération : étape 2 avec un jeton inconnu refusée");
+    ok((await as(maxine, () => api("GET", "/auth/me"))).status === 200, "récupération : rien n'a changé après les refus (session et ancien mot de passe valables)");
+    jar.current = "";
+    const f2 = await finish(step1.body.mfaToken);
+    ok(f2.status === 200 && f2.body.user?.id === maxine.user.id && jar.current.length > 0, "récupération : avec le jeton de l'étape 1, le mot de passe est redéfini et la session ouverte");
+    ok((await finish(step1.body.mfaToken)).status === 401, "récupération : le jeton ne sert qu'une fois");
+    maxPw = newPw;
+    maxine = { ...maxine, cookie: jar.current };
+    const old = await loginStep1("maxine@test.local", "maxine-password-1");
+    ok(old.status === 401, "récupération : l'ancien mot de passe ne marche plus");
+    const viaNew = await loginStep1("maxine@test.local", maxPw);
+    ok(viaNew.status === 200 && viaNew.body.mfaRequired === true, "récupération : le nouveau mot de passe marche, et le MFA reste actif");
+  }
+
+  // ---- Nolan: disable, re-enable, brute force ----
+  const enrol = async (u: U, authKey: string) => {
+    const s = (await as(u, () => api("POST", "/account/mfa/setup", { authKey }))).body;
+    const r = await as(u, () => api("POST", "/account/mfa/enable", { code: fresh(s.secret, u.user.id) }));
+    return { secret: s.secret as string, codes: r.body.backupCodes as string[] };
+  };
+  let nol = await enrol(nolan, authNol);
+  ok(nol.codes?.length === 10, "Nolan : MFA activée");
+  ok((await as(nolan, () => api("POST", "/account/mfa/disable", { authKey: authNol }))).status === 401, "désactivation : sans code, refusée");
+  ok((await as(nolan, () => api("POST", "/account/mfa/disable", { authKey: authMax, code: fresh(nol.secret, nolan.user.id) }))).status === 403, "désactivation : mauvais mot de passe refusé");
+  ok((await as(nolan, () => api("POST", "/account/mfa/disable", { authKey: authNol, code: "000000" }))).status === 401, "désactivation : mauvais code refusé");
+  const dis = await as(nolan, () => api("POST", "/account/mfa/disable", { authKey: authNol, code: fresh(nol.secret, nolan.user.id) }));
+  const rowN = rw.prepare("SELECT totp_secret, totp_enabled, totp_pending, totp_last_step FROM users WHERE id = ?").get(nolan.user.id) as any;
+  ok(dis.status === 200 && rowN.totp_enabled === 0 && rowN.totp_secret === null && (rw.prepare("SELECT COUNT(*) AS n FROM mfa_backup_codes WHERE user_id = ?").get(nolan.user.id) as any).n === 0, "désactivation : MFA, secret et codes de secours supprimés");
+  ok((await loginStep1("nolan@test.local", "nolan-password-1")).body.user?.id === nolan.user.id, "désactivation : la connexion redevient directe");
+  ok(logLines().some((l) => l.includes(`event=mfa_disabled account=${nolan.user.id}`)), "journal : mfa_disabled");
+  nol = await enrol(nolan, authNol);
+
+  // Brute force: 10 wrong codes (two tokens) lock the account, even for the right code.
+  const wrongOn = async (token: string, n: number) => {
+    for (let i = 0; i < n; i++) await api("POST", "/auth/mfa", { mfaToken: token, code: "222222" });
+  };
+  const tN1 = await loginStep1("nolan@test.local", "nolan-password-1");
+  await wrongOn(tN1.body.mfaToken, 5);
+  const tN2 = await loginStep1("nolan@test.local", "nolan-password-1");
+  await wrongOn(tN2.body.mfaToken, 5);
+  const tN3 = await loginStep1("nolan@test.local", "nolan-password-1");
+  const locked = await api("POST", "/auth/mfa", { mfaToken: tN3.body.mfaToken, code: fresh(nol.secret, nolan.user.id) });
+  ok(locked.status === 429 && /plus tard/.test(locked.body.error) && jar.current === "", "force brute : 10 mauvais codes → compte verrouillé, même avec le bon code (429)");
+  ok(logLines().some((l) => l.includes(`event=account_locked scope=mfa account=${nolan.user.id}`)), "journal : account_locked scope=mfa");
+  const nrec = await c.recoveryKeys(c.parseRecoveryKey(nolan.recovery));
+  const lockedRecover = await patient(() => api("POST", "/auth/recover", { email: "nolan@test.local", recoveryAuth: nrec.recoveryAuth, mfaCode: fresh(nol.secret, nolan.user.id) }));
+  ok(lockedRecover.status === 429 && /plus tard/.test(lockedRecover.body.error) && !("recoveryEncPrivateKey" in lockedRecover.body), "force brute : le verrou « mfa » vaut aussi pour la récupération (429, aucune clé)");
+
+  // ---- Required for admins ----
+  const reqNoMfa = await as(alice, () => api("PATCH", "/admin/settings", { mfaRequiredAdmins: true }));
+  ok(reqNoMfa.status === 400 && /double authentification/.test(reqNoMfa.body.error), "admins : impossible d'exiger le MFA sans l'avoir soi-même (400 explicite)");
+  ok((await as(maxine, () => api("GET", "/admin"))).body.mfaRequiredAdmins === false, "admins : réglage désactivé par défaut");
+  ok((await as(maxine, () => api("PATCH", "/admin/settings", { mfaRequiredAdmins: true }))).status === 200, "admins : un admin avec MFA peut l'exiger");
+  const blocked = await as(alice, () => api("GET", "/admin"));
+  ok(blocked.status === 403 && blocked.body.code === "MFA_REQUIRED", "admins : sans MFA, /api/admin répond 403 MFA_REQUIRED");
+  ok((await as(alice, () => api("GET", "/admin/smtp"))).body.code === "MFA_REQUIRED" && (await as(alice, () => api("PATCH", "/admin/settings", { registrationOpen: true }))).body.code === "MFA_REQUIRED", "admins : toutes les routes d'administration sont bloquées");
+  ok((await as(alice, () => api("GET", "/account"))).status === 200 && (await as(alice, () => api("GET", "/tree"))).status === 200, "admins : la session de l'admin sans MFA reste valable pour le reste");
+  ok((await as(alice, () => api("GET", "/account"))).body.mfa.required === true, "admins : /account indique que le MFA est obligatoire");
+  const adminMax = (await as(maxine, () => api("GET", "/admin"))).body;
+  ok(adminMax.mfaRequiredAdmins === true && adminMax.users.find((u: any) => u.id === maxine.user.id)?.mfaEnabled === true && adminMax.users.find((u: any) => u.id === alice.user.id)?.mfaEnabled === false, "admins : la liste des utilisateurs indique le MFA de chacun");
+  const maxAuthNow = await authKeyOf(maxine, maxPw);
+  const noDisable = await as(maxine, () => api("POST", "/account/mfa/disable", { authKey: maxAuthNow, code: fresh(setup.secret, maxine.user.id) }));
+  ok(noDisable.status === 403, "admins : un admin ne peut pas désactiver son MFA quand il est obligatoire");
+
+  // Reset by an admin.
+  ok((await as(maxine, () => api("POST", `/admin/users/${maxine.user.id}/mfa-reset`))).status === 400, "réinitialisation : pas sur soi-même");
+  ok((await as(maxine, () => api("POST", `/admin/users/${bob.user.id}/mfa-reset`))).status === 400, "réinitialisation : refusée si le compte n'a pas de MFA");
+  ok((await as(bob, () => api("POST", `/admin/users/${nolan.user.id}/mfa-reset`))).status === 403, "réinitialisation : réservée aux admins");
+  ok((await as(maxine, () => api("POST", `/admin/users/${c.randomId()}/mfa-reset`))).status === 404, "réinitialisation : compte inconnu → 404");
+  const reset = await as(maxine, () => api("POST", `/admin/users/${nolan.user.id}/mfa-reset`));
+  const rowR = rw.prepare("SELECT totp_enabled, totp_secret FROM users WHERE id = ?").get(nolan.user.id) as any;
+  ok(reset.status === 200 && rowR.totp_enabled === 0 && rowR.totp_secret === null && (rw.prepare("SELECT COUNT(*) AS n FROM mfa_backup_codes WHERE user_id = ?").get(nolan.user.id) as any).n === 0, "réinitialisation : MFA désactivé, secret et codes supprimés");
+  ok((await loginStep1("nolan@test.local", "nolan-password-1")).body.user?.id === nolan.user.id, "réinitialisation : le compte se connecte avec son seul mot de passe");
+  ok(logLines().some((l) => l.includes(`event=mfa_reset by=${maxine.user.id} account=${nolan.user.id}`)), "journal : mfa_reset by=<admin> account=<id>");
+  await as(maxine, () => api("PATCH", "/admin/settings", { mfaRequiredAdmins: false }));
+  ok((await as(alice, () => api("GET", "/admin"))).status === 200, "admins : réglage coupé, l'admin sans MFA retrouve l'administration");
+
+  // ---- MCP login with the code ----
+  {
+    const bundle = new URL("../mcp/dist/excalibash-mcp.mjs", import.meta.url).pathname;
+    const dir = mkdtempSync(join(tmpdir(), "eb-mcp-mfa-"));
+    const run = (args: string[], env: Record<string, string>) =>
+      new Promise<{ code: number; err: string }>((resolve) => {
+        const p = spawn(process.execPath, [bundle, ...args], { env: { ...process.env, ...env }, stdio: ["ignore", "ignore", "pipe"] });
+        let err = "";
+        p.stderr.on("data", (d) => (err += d));
+        p.on("exit", (code) => resolve({ code: code ?? -1, err }));
+      });
+    const env = { EXCALIBASH_URL: BASE, EXCALIBASH_EMAIL: "maxine@test.local", EXCALIBASH_PASSWORD: maxPw };
+    const cfg = join(dir, "mcp.json");
+    const noCodeRun = await run(["login", "--config", cfg], env);
+    ok(noCodeRun.code !== 0 && !existsSync(cfg), "MCP : compte avec MFA sans code → connexion refusée");
+    const wrongRun = await run(["login", "--config", cfg], { ...env, EXCALIBASH_TOTP: "000000" });
+    ok(wrongRun.code !== 0 && !existsSync(cfg), "MCP : mauvais code → connexion refusée");
+    const goodRun = await run(["login", "--config", cfg], { ...env, EXCALIBASH_TOTP: fresh(setup.secret, maxine.user.id) });
+    ok(goodRun.code === 0 && existsSync(cfg), "MCP : EXCALIBASH_TOTP → connexion réussie");
+  }
+
+  // The journal never holds an email, a code or a secret.
+  const sec = logLines().filter((l) => l.startsWith("excalibash-security "));
+  ok(sec.some((l) => l.includes("event=auth_failed scope=mfa ip=")) && !sec.some((l) => l.includes("@") || l.includes(setup.secret) || maxCodes.some((x) => l.includes(x))), "journal : auth_failed scope=mfa, sans email, code ni secret");
+  ok(!readFileSync(`${dirname(DB)}/server.log`, "utf8").includes(setup.secret), "le secret TOTP n'apparaît jamais dans les logs");
 }
 
 // Unauthenticated hardening (after the MCP tests: the login rate limit below would lock Alice out).

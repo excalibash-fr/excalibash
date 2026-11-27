@@ -27,6 +27,9 @@ import { config } from "../config.ts";
 import { emailEnabled, sendVerificationCode, verificationRequired } from "../mailer.ts";
 import { notify } from "../notify.ts";
 import { createChallenge, verifyPow } from "../pow.ts";
+import { assertNotLocked, failed, succeeded } from "../lockout.ts";
+import { backupRemaining, checkSecondFactor, dropMfaToken, dropMfaTokensOf, issueMfaToken, mfaTokenUser, strikeMfaToken } from "../mfa.ts";
+import { securityEvent } from "../securityLog.ts";
 import { kickUser } from "../rooms.ts";
 import { dropUserTunnelSessions } from "../tunnelSessions.ts";
 import { isEmail } from "../validate.ts";
@@ -50,13 +53,11 @@ export function announceSetup() {
   console.log(`Code d'installation (création du compte administrateur) : ${setupCode.slice(0, 4)}-${setupCode.slice(4)}`);
 }
 
-function checkSetupCode(code: unknown) {
+function setupCodeMatches(code: unknown): boolean {
   if (!setupCode) announceSetup();
   const given = Buffer.from(normalizeCode(code));
   const want = Buffer.from(setupCode ?? "");
-  if (given.length !== want.length || !timingSafeEqual(given, want)) {
-    throw new HttpError(403, "Code d'installation invalide : il est affiché dans les logs du serveur");
-  }
+  return given.length === want.length && timingSafeEqual(given, want);
 }
 
 function registrationOpen(): boolean {
@@ -124,7 +125,11 @@ authApi.post("/register", async (req, res) => {
   let invite: InviteRow | undefined;
   if (userCount() === 0) {
     limit(`setup:${req.ip}`, 10, 600_000);
-    checkSetupCode(b.setupCode);
+    assertNotLocked("login", { ip: req.ip! });
+    if (!setupCodeMatches(b.setupCode)) {
+      await failed("login", { ip: req.ip! });
+      throw new HttpError(403, "Code d'installation invalide : il est affiché dans les logs du serveur");
+    }
   } else if (b.invite) {
     invite = db.prepare("SELECT * FROM invites WHERE token_hash = ?").get(sha256(String(b.invite))) as InviteRow | undefined;
     if (!invite || invite.used_by || invite.expires_at < Date.now()) throw new HttpError(403, "Invitation invalide ou expirée");
@@ -186,24 +191,30 @@ authApi.post("/register", async (req, res) => {
   res.json({ user: toUser(getUserRow(b.id)!) });
 });
 
-authApi.post("/verify", (req, res) => {
+authApi.post("/verify", async (req, res) => {
   const email = str(req.body.email);
   const code = str(req.body.code, 12);
   limit(`verify:${req.ip}`, 20);
   limit(`verify:${email.toLowerCase()}`, 10);
-  const bad = () => new HttpError(400, "Code incorrect ou expiré");
+  const keys = { account: email, ip: req.ip! };
+  assertNotLocked("login", keys);
   const row = findUserByEmail(email);
-  if (!row) throw bad();
+  const bad = async () => {
+    await failed("login", keys, row ? { account: row.id } : {});
+    return new HttpError(400, "Code incorrect ou expiré");
+  };
+  if (!row) throw await bad();
   const f = flags(row.id);
-  if (f.email_verified || !f.verify_code_hash || !f.verify_expires || f.verify_expires < Date.now()) throw bad();
+  if (f.email_verified || !f.verify_code_hash || !f.verify_expires || f.verify_expires < Date.now()) throw await bad();
   if (f.verify_attempts >= 5) {
     db.prepare("UPDATE users SET verify_code_hash = NULL, verify_expires = NULL WHERE id = ?").run(row.id);
-    throw bad();
+    throw await bad();
   }
   db.prepare("UPDATE users SET verify_attempts = verify_attempts + 1 WHERE id = ?").run(row.id);
   const a = Buffer.from(sha256(code));
   const b = Buffer.from(f.verify_code_hash);
-  if (a.length !== b.length || !timingSafeEqual(a, b)) throw bad();
+  if (a.length !== b.length || !timingSafeEqual(a, b)) throw await bad();
+  succeeded("login", keys);
   db.prepare("UPDATE users SET email_verified = 1, verify_code_hash = NULL, verify_expires = NULL, verify_attempts = 0 WHERE id = ?").run(row.id);
   checkSuspended(row.id);
   createSession(req, res, row.id);
@@ -229,14 +240,28 @@ authApi.post("/login", async (req, res) => {
   const email = str(req.body.email);
   limit(`login:${req.ip}`, 20);
   limit(`login:${email.toLowerCase()}`, 8);
+  const keys = { account: email, ip: req.ip! };
+  assertNotLocked("login", keys);
   const row = findUserByEmail(email);
   const authKey = String(req.body.authKey ?? "");
   if (!row || !(await verifySecretAsync(authKey, row.auth_hash))) {
     if (!row) await burnVerifyAsync(authKey);
+    await failed("login", keys, row ? { account: row.id } : {});
     throw new HttpError(401, "Email ou mot de passe incorrect");
   }
+  succeeded("login", keys);
   if (!flags(row.id).email_verified) coded(403, "Vérifie ton email pour te connecter.", "EMAIL_NOT_VERIFIED");
   checkSuspended(row.id);
+  // Password right, second factor on: no session and no keys until the code is given (POST /mfa).
+  if (row.totp_enabled) {
+    res.json({ mfaRequired: true, mfaToken: issueMfaToken(row.id) });
+    return;
+  }
+  finishLogin(req, res, row);
+});
+
+/** Opens the session and answers a login: the user and the encrypted private key. */
+function finishLogin(req: Request, res: Response, row: UserRow) {
   createSession(req, res, row.id);
   const when = new Date().toLocaleString("fr-FR", { dateStyle: "full", timeStyle: "short" });
   notify(req, [row.id], "newLogin", "Excalibash : nouvelle connexion à ton compte", () => ({
@@ -246,33 +271,99 @@ authApi.post("/login", async (req, res) => {
     note: "Si c'est toi, tu n'as rien à faire. Sinon, change ton mot de passe tout de suite : les autres appareils seront déconnectés.",
   }));
   res.json({ user: toUser(row), keys: { publicKey: row.public_key, encPrivateKey: row.enc_private_key } });
+}
+
+const BAD_CODE = "Code incorrect";
+
+/** Counts a wrong second-factor code (journal, delay, lock) and answers: always the same 401. */
+async function badCode(userId: string | undefined, ip: string): Promise<HttpError> {
+  await failed("mfa", { account: userId, ip });
+  return new HttpError(401, BAD_CODE);
+}
+
+/**
+ * Step 2 of a login with a second factor: the token from /login plus a TOTP or a backup code. A wrong code, an
+ * unknown or expired token all look the same; the token is destroyed at its 5th wrong code.
+ */
+authApi.post("/mfa", async (req, res) => {
+  limit(`mfa:${req.ip}`, 60);
+  const token = typeof req.body.mfaToken === "string" ? req.body.mfaToken.slice(0, 100) : "";
+  const userId = mfaTokenUser(token);
+  const keys = { account: userId, ip: req.ip! };
+  assertNotLocked("mfa", keys);
+  const row = userId ? getUserRow(userId) : undefined;
+  if (!row) throw await badCode(userId, req.ip!);
+  const used = checkSecondFactor(row, String(req.body.code ?? "").slice(0, 40));
+  if (!used) {
+    strikeMfaToken(token);
+    throw await badCode(row.id, req.ip!);
+  }
+  dropMfaToken(token);
+  succeeded("mfa", keys);
+  if (used === "backup") securityEvent("mfa_backup_used", { account: row.id, remaining: backupRemaining(row.id) });
+  if (!flags(row.id).email_verified) coded(403, "Vérifie ton email pour te connecter.", "EMAIL_NOT_VERIFIED");
+  checkSuspended(row.id);
+  finishLogin(req, res, row);
 });
 
-/** Step 1 of account recovery: prove the recovery key, receive the private key encrypted under it. */
-authApi.post("/recover", async (req, res) => {
+/** The account whose recovery key the request proves (401 otherwise); failures are counted like logins. */
+async function checkRecoveryKey(req: Request): Promise<UserRow> {
   const email = str(req.body.email);
   limit(`recover:${req.ip}`, 5);
+  const keys = { account: email, ip: req.ip! };
+  assertNotLocked("recover", keys);
   const row = findUserByEmail(email);
   const proof = String(req.body.recoveryAuth ?? "");
   if (!row || !(await verifySecretAsync(proof, row.recovery_auth_hash))) {
     if (!row) await burnVerifyAsync(proof);
+    await failed("recover", keys, row ? { account: row.id } : {});
     throw new HttpError(401, "Email ou clé de récupération incorrecte");
   }
+  succeeded("recover", keys);
+  return row;
+}
+
+/**
+ * Step 1 of account recovery: prove the recovery key, receive the private key encrypted under it. With a second
+ * factor, nothing but `mfaRequired` comes back until a valid `mfaCode` is given; the answer then also carries a
+ * one-time token that step 2 requires.
+ */
+authApi.post("/recover", async (req, res) => {
+  const row = await checkRecoveryKey(req);
   checkSuspended(row.id);
-  res.json({ userId: row.id, publicKey: row.public_key, recoveryEncPrivateKey: row.recovery_enc_private_key });
+  let mfaToken: string | undefined;
+  if (row.totp_enabled) {
+    const code = typeof req.body.mfaCode === "string" ? req.body.mfaCode.slice(0, 40) : "";
+    if (!code) {
+      res.json({ mfaRequired: true });
+      return;
+    }
+    const keys = { account: row.id, ip: req.ip! };
+    assertNotLocked("mfa", keys);
+    const used = checkSecondFactor(row, code);
+    if (!used) throw await badCode(row.id, req.ip!);
+    succeeded("mfa", keys);
+    if (used === "backup") securityEvent("mfa_backup_used", { account: row.id, remaining: backupRemaining(row.id) });
+    mfaToken = issueMfaToken(row.id, "recover");
+  }
+  res.json({ userId: row.id, publicKey: row.public_key, recoveryEncPrivateKey: row.recovery_enc_private_key, mfaToken });
 });
 
 /** Step 2: set a new password (re-encrypted private key), logging out every other session. */
 authApi.post("/recover/finish", async (req, res) => {
-  const email = str(req.body.email);
-  limit(`recover:${req.ip}`, 5);
-  const row = findUserByEmail(email);
-  const proof = String(req.body.recoveryAuth ?? "");
-  if (!row || !(await verifySecretAsync(proof, row.recovery_auth_hash))) {
-    if (!row) await burnVerifyAsync(proof);
-    throw new HttpError(401, "Email ou clé de récupération incorrecte");
-  }
+  const row = await checkRecoveryKey(req);
   checkSuspended(row.id);
+  // The recovery key alone must not get around the second factor: step 1 gave a token for a valid code.
+  const mfaToken = typeof req.body.mfaToken === "string" ? req.body.mfaToken.slice(0, 100) : "";
+  if (row.totp_enabled) {
+    const keys = { account: row.id, ip: req.ip! };
+    assertNotLocked("mfa", keys);
+    if (mfaTokenUser(mfaToken, "recover") !== row.id) {
+      strikeMfaToken(mfaToken);
+      throw await badCode(row.id, req.ip!);
+    }
+    dropMfaToken(mfaToken);
+  }
   db.prepare("UPDATE users SET auth_hash = ?, kdf_salt = ?, enc_private_key = ? WHERE id = ?").run(
     await hashSecretAsync(blob(req.body.authKey, 100)),
     blob(req.body.salt, 64),
@@ -281,6 +372,7 @@ authApi.post("/recover/finish", async (req, res) => {
   );
   db.prepare("DELETE FROM sessions WHERE user_id = ?").run(row.id);
   dropUserTunnelSessions(row.id);
+  dropMfaTokensOf(row.id);
   // Live boards opened with the old sessions are cut too (the client reconnects if it still can).
   kickUser(row.id, 4001, "session terminée");
   createSession(req, res, row.id);
@@ -318,10 +410,16 @@ authApi.put("/vault", (req, res) => {
   res.json({ ok: true });
 });
 
-authApi.post("/password", (req, res) => {
+authApi.post("/password", async (req, res) => {
   limit(`pw:${req.user!.id}`, 5);
+  const keys = { account: req.user!.id, ip: req.ip! };
+  assertNotLocked("reauth", keys);
   const row = getUserRow(req.user!.id)!;
-  if (!verifySecret(String(req.body.authKey ?? ""), row.auth_hash)) throw new HttpError(400, "Mot de passe actuel incorrect");
+  if (!verifySecret(String(req.body.authKey ?? ""), row.auth_hash)) {
+    await failed("reauth", keys);
+    throw new HttpError(400, "Mot de passe actuel incorrect");
+  }
+  succeeded("reauth", keys);
   db.prepare("UPDATE users SET auth_hash = ?, kdf_salt = ?, enc_private_key = ? WHERE id = ?").run(
     hashSecret(blob(req.body.newAuthKey, 100)),
     blob(req.body.newSalt, 64),
@@ -331,6 +429,7 @@ authApi.post("/password", (req, res) => {
   // Every other device must log in again with the new password.
   db.prepare("DELETE FROM sessions WHERE user_id = ? AND token_hash != ?").run(row.id, currentSessionHash(req) ?? "");
   dropUserTunnelSessions(row.id, currentSessionHash(req) ?? "");
+  dropMfaTokensOf(row.id);
   kickUser(row.id, 4001, "session terminée");
   res.json({ ok: true });
 });

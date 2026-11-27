@@ -1,6 +1,9 @@
-import { Router } from "express";
+import { Router, type Request } from "express";
 import { db } from "../db.ts";
-import { currentSessionHash, destroySession, rateLimit, requireUser, verifySecret, getUserRow } from "../auth.ts";
+import { currentSessionHash, destroySession, rateLimit, requireUser, verifySecret, verifySecretAsync, getUserRow, type UserRow } from "../auth.ts";
+import { assertNotLocked, failed, succeeded } from "../lockout.ts";
+import { backupRemaining, beginSetup, checkSecondFactor, clearMfa, dropMfaTokensOf, finishSetup, mfaRequiredForAdmins, newBackupCodes } from "../mfa.ts";
+import { securityEvent } from "../securityLog.ts";
 import { kickSession } from "../rooms.ts";
 import { dropMainSessionTunnels, dropUserTunnelSessions } from "../tunnelSessions.ts";
 import { HttpError, blob } from "../http.ts";
@@ -24,6 +27,7 @@ accountApi.get("/", (req, res) => {
     findableEmail: !!row.findable_email,
     notifications: getPrefs(req.user!.id),
     emailEnabled: emailEnabled(),
+    mfa: { enabled: !!req.user!.mfaEnabled, backupCodesLeft: backupRemaining(req.user!.id), required: req.user!.isAdmin && mfaRequiredForAdmins() },
   });
 });
 
@@ -91,12 +95,18 @@ accountApi.delete("/sessions/:id", (req, res) => {
   res.json({ ok: true, current: row.token_hash === currentSessionHash(req) });
 });
 
-accountApi.delete("/", (req, res) => {
+accountApi.delete("/", async (req, res) => {
   const user = req.user!;
   if (!rateLimit(`account-delete:${user.id}`, 5, 15 * 60_000)) throw new HttpError(429, "Trop d'essais, réessaie plus tard");
   const authKey = blob(req.body?.authKey, 100);
+  const keys = { account: user.id, ip: req.ip! };
+  assertNotLocked("reauth", keys);
   const row = getUserRow(user.id);
-  if (!row || !verifySecret(authKey, row.auth_hash)) throw new HttpError(403, "Mot de passe incorrect");
+  if (!row || !verifySecret(authKey, row.auth_hash)) {
+    await failed("reauth", keys);
+    throw new HttpError(403, "Mot de passe incorrect");
+  }
+  succeeded("reauth", keys);
   if (user.isAdmin) {
     const others = db.prepare("SELECT COUNT(*) AS n FROM users WHERE id != ?").get(user.id) as { n: number };
     const admins = db.prepare("SELECT COUNT(*) AS n FROM users WHERE is_admin = 1 AND id != ?").get(user.id) as { n: number };
@@ -105,4 +115,85 @@ accountApi.delete("/", (req, res) => {
   purgeUser(user.id);
   destroySession(req, res);
   res.json({ ok: true });
+});
+
+// ---- Second factor (TOTP) ---------------------------------------------------------------
+
+/** Password re-entry for the sensitive MFA actions: failures count in the "reauth" scope. */
+async function reauth(req: Request, authKey: unknown): Promise<UserRow> {
+  const keys = { account: req.user!.id, ip: req.ip! };
+  assertNotLocked("reauth", keys);
+  const row = getUserRow(req.user!.id)!;
+  if (!(await verifySecretAsync(blob(authKey, 100), row.auth_hash))) {
+    await failed("reauth", keys);
+    throw new HttpError(403, "Mot de passe incorrect");
+  }
+  succeeded("reauth", keys);
+  return row;
+}
+
+/** A TOTP or backup code of the account, used up: failures count in the "mfa" scope, the answer is always the same. */
+async function checkCode(req: Request, row: UserRow, code: unknown): Promise<"totp" | "backup"> {
+  const keys = { account: row.id, ip: req.ip! };
+  assertNotLocked("mfa", keys);
+  const used = checkSecondFactor(row, String(code ?? "").slice(0, 40));
+  if (!used) {
+    await failed("mfa", keys);
+    throw new HttpError(401, "Code incorrect");
+  }
+  succeeded("mfa", keys);
+  if (used === "backup") securityEvent("mfa_backup_used", { account: row.id, remaining: backupRemaining(row.id) });
+  return used;
+}
+
+const mfaLimit = (req: Request) => {
+  if (!rateLimit(`mfa-manage:${req.user!.id}`, 20)) throw new HttpError(429, "Trop d'essais, réessaie dans une minute");
+};
+
+/** Starts the activation: password again, then a fresh secret (kept as pending) to put in an authenticator app. */
+accountApi.post("/mfa/setup", async (req, res) => {
+  mfaLimit(req);
+  const row = await reauth(req, req.body?.authKey);
+  if (row.totp_enabled) throw new HttpError(400, "La double authentification est déjà activée");
+  res.json(beginSetup(row.id, row.email));
+});
+
+/** Ends the activation with a first code from the app; answers the backup codes, which are never shown again. */
+accountApi.post("/mfa/enable", async (req, res) => {
+  mfaLimit(req);
+  const row = getUserRow(req.user!.id)!;
+  if (row.totp_enabled) throw new HttpError(400, "La double authentification est déjà activée");
+  if (!row.totp_pending) throw new HttpError(400, "Commence par générer un secret");
+  const keys = { account: row.id, ip: req.ip! };
+  assertNotLocked("mfa", keys);
+  const backupCodes = finishSetup(row, String(req.body?.code ?? "").slice(0, 40));
+  if (!backupCodes) {
+    await failed("mfa", keys);
+    throw new HttpError(401, "Code incorrect");
+  }
+  succeeded("mfa", keys);
+  securityEvent("mfa_enabled", { account: row.id });
+  res.json({ backupCodes });
+});
+
+accountApi.post("/mfa/disable", async (req, res) => {
+  mfaLimit(req);
+  const user = req.user!;
+  if (!user.mfaEnabled) throw new HttpError(400, "La double authentification n'est pas activée");
+  if (user.isAdmin && mfaRequiredForAdmins()) throw new HttpError(403, "Les administrateurs doivent garder la double authentification : un administrateur ne peut pas la désactiver");
+  const row = await reauth(req, req.body?.authKey);
+  await checkCode(req, row, req.body?.code);
+  clearMfa(row.id);
+  dropMfaTokensOf(row.id);
+  securityEvent("mfa_disabled", { account: row.id });
+  res.json({ ok: true });
+});
+
+/** 10 new backup codes (the old ones stop working); needs a current code. */
+accountApi.post("/mfa/backup-codes", async (req, res) => {
+  mfaLimit(req);
+  const row = getUserRow(req.user!.id)!;
+  if (!row.totp_enabled) throw new HttpError(400, "La double authentification n'est pas activée");
+  await checkCode(req, row, req.body?.code);
+  res.json({ backupCodes: newBackupCodes(row.id) });
 });

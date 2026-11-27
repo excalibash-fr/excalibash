@@ -14,6 +14,7 @@ export type User = {
   isAdmin: boolean;
   color: string;
   publicKey: string;
+  mfaEnabled: boolean;
 };
 
 export type UserRow = {
@@ -28,6 +29,10 @@ export type UserRow = {
   recovery_auth_hash: string;
   enc_vault: string | null;
   is_admin: number;
+  totp_secret: string | null;
+  totp_enabled: number;
+  totp_last_step: number;
+  totp_pending: string | null;
   color: string;
   findable_name: number;
   findable_email: number;
@@ -56,7 +61,7 @@ export function pickColor(n: number): string {
 }
 
 export function toUser(r: UserRow): User {
-  return { id: r.id, email: r.email, name: r.name, isAdmin: !!r.is_admin, color: r.color, publicKey: r.public_key };
+  return { id: r.id, email: r.email, name: r.name, isAdmin: !!r.is_admin, color: r.color, publicKey: r.public_key, mfaEnabled: !!r.totp_enabled };
 }
 
 export function sha256(s: string): string {
