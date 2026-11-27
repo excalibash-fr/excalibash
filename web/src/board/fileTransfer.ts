@@ -30,11 +30,11 @@ export function validName(name: string): boolean {
 }
 
 export class FileError extends Error {
-  constructor(
-    message: string,
-    readonly code?: string,
-  ) {
+  readonly code?: string;
+
+  constructor(message: string, code?: string) {
     super(message);
+    this.code = code;
   }
 }
 
@@ -48,10 +48,13 @@ export type Signal = { aborted: boolean; stop?: boolean };
 
 /** The file operations of one local shell. */
 export class FileClient {
-  constructor(
-    private session: BoardSession,
-    private term: string,
-  ) {}
+  private session: BoardSession;
+  private term: string;
+
+  constructor(session: BoardSession, term: string) {
+    this.session = session;
+    this.term = term;
+  }
 
   /** The terminal this client talks through (a stable identity: the client itself is cheap and rebuilt often). */
   get terminal(): string {
