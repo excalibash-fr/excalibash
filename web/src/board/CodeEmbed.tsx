@@ -37,6 +37,8 @@ import { kernelCwd } from "./notebookDoc.ts";
 import { classifyOutputs } from "./notebookRender.ts";
 import { Outputs } from "./OutputView.tsx";
 import { bindPythonKernel } from "./pyKernel.ts";
+import { applyEditorSettings, useEditorSettings } from "./editorSettings.ts";
+import { EditorSettingsMenu } from "./EditorSettingsMenu.tsx";
 import { saveBlob } from "../download.ts";
 
 /** What the window needs from the app's UI kit, handed in by the board page (this chunk must not import it: see BoardPage). */
@@ -252,6 +254,12 @@ export default function CodeEmbed({ host, session, docId, nodeId, active, shells
     // The file's own kernel first, else a kernel a notebook of the node already follows.
     return bindPythonKernel(ed, model, () => (runner?.term && runner.status !== "dead" ? runner : peekNotebookRunner(session, notebooksRef.current)));
   }, [ready, doc, meta.language, session, runner]);
+
+  // Local editor preferences; declared after the kernel binding so they win over its suggestion defaults.
+  const { settings: editorPrefs } = useEditorSettings();
+  useEffect(() => {
+    if (editorRef.current) applyEditorSettings(editorRef.current, editorPrefs, false, meta.language !== "python");
+  }, [editorPrefs, doc, ready, meta.language, runner]);
 
   const dirty = sha !== null && isDirty(sha, meta.savedSha);
   const text = () => doc!.ydoc.getText("content").toString();
@@ -519,6 +527,7 @@ export default function CodeEmbed({ host, session, docId, nodeId, active, shells
             </option>
           ))}
         </select>
+        <EditorSettingsMenu />
         <div className="code-people" aria-label="Personnes dans le document">
           {people.slice(0, 5).map((p) => (
             <div key={p.clientId} className="avatar" style={{ background: p.color }} title={p.self ? `${p.name} (vous)` : p.name}>
