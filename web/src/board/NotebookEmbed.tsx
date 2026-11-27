@@ -68,6 +68,7 @@ import { Outputs } from "./OutputView.tsx";
 import type { NotebookRunner } from "./notebookRunner.ts";
 import { acquireNotebook, sessionEnv } from "./notebookService.ts";
 import { bindPythonKernel, type KernelQuery } from "./pyKernel.ts";
+import { applyEditorSettings, useEditorSettings } from "./editorSettings.ts";
 
 /** What the window needs from the app (handed in by the board page: this chunk must not import the UI kit, see BoardPage). */
 export type NotebookHost = {
@@ -298,6 +299,11 @@ const NotebookCell = memo(function NotebookCell(p: CellProps) {
     // The editor is rebuilt for another cell kind or when it scrolls in / out of range; theme and read-only are applied below.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [wantEditor, source, language, editing]);
+  // Local editor preferences (after the creation effect, so they win over the kernel's suggestion defaults).
+  const { settings: editorPrefs } = useEditorSettings();
+  useEffect(() => {
+    if (editorRef.current) applyEditorSettings(editorRef.current, editorPrefs, true, language !== "python");
+  }, [editorPrefs, wantEditor, source, language, editing]);
   useEffect(() => {
     monaco.editor.setTheme(p.theme === "dark" ? "vs-dark" : "vs");
   }, [p.theme]);

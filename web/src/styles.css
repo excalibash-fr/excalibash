@@ -2397,6 +2397,20 @@ html.dark .term.broadcasting {
 .term-head button:disabled:hover {
   background: none;
 }
+.es-menu {
+  width: 260px;
+}
+.es-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 5px 10px;
+  font-size: 13px;
+}
+.es-row select {
+  height: 24px;
+}
 .code-people {
   display: flex;
   flex: none;
