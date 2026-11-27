@@ -2,11 +2,22 @@ import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { ExternalLink, Globe, Minimize2, Power, RotateCw } from "lucide-react";
 import type { BoardSession } from "./collab.ts";
 import { confirmDialog } from "../components/ui.tsx";
-import { serverConfig } from "../api.ts";
+import { api, serverConfig } from "../api.ts";
 import { keepFramesOnMove } from "./nodes.ts";
 
-/** Origin serving tunnelled sites (separate from Excalibash's own, see server/src/proxy.ts). */
-const proxyUrl = () => serverConfig().then((c) => c.proxyUrl.replace(/\/$/, ""));
+/** Tunnel ids that can be a hostname (see isTunnelId on the server); older ids only work in path mode. */
+const isTunnelId = (id: string) => /^[a-z2-7]{26}$/.test(id);
+
+/**
+ * Where a tunnel's site lives (separate from Excalibash's own origin, see server/src/proxy.ts): its own
+ * subdomain when the instance has TUNNEL_DOMAIN, else /t/<id>/ on the shared proxy origin.
+ * `base` is null for a tunnel too old for subdomains.
+ */
+const tunnelLocation = (webId: string) =>
+  serverConfig().then((c): { url: string | null; subdomain: boolean } => {
+    if (c.tunnelDomain) return { url: isTunnelId(webId) ? `${c.tunnelScheme}://${webId}.${c.tunnelDomain}/` : null, subdomain: true };
+    return { url: `${c.proxyUrl.replace(/\/$/, "")}/t/${webId}/`, subdomain: false };
+  });
 
 /**
  * A site reached through an end-to-end encrypted tunnel to one of the board's machines. The page
@@ -17,33 +28,52 @@ export function WebEmbed(p: { session: BoardSession; webId: string; active: bool
     (cb) => p.session.on("terminals", cb),
     () => p.session.webs.get(p.webId),
   );
-  const [base, setBase] = useState<string | null>(null);
+  const [where, setWhere] = useState<{ url: string | null; subdomain: boolean } | null>(null);
   const [nonce, setNonce] = useState(0);
   const frame = useRef<HTMLIFrameElement>(null);
   const popups = useRef(new Set<Window>());
   const rootRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    proxyUrl().then(setBase).catch(() => setBase(null));
+    tunnelLocation(p.webId).then(setWhere).catch(() => setWhere(null));
     // A reorder of the windows (raised here or by someone else) must not reload this page.
     keepFramesOnMove();
-  }, []);
+  }, [p.webId]);
 
-  // Key handshake with the proxy origin's boot page.
+  // Key handshake with the proxy origin's boot page. In subdomain mode the page also gets a one-time
+  // ticket, which its origin swaps for a cookie session (the server never learns anything else).
   useEffect(() => {
-    if (!base) return;
-    const origin = new URL(base).origin;
+    if (!where?.url) return;
+    const origin = new URL(where.url).origin;
+    const subdomain = where.subdomain;
+    const answering = new Set<Window>();
     const onMessage = async (e: MessageEvent) => {
       if (e.origin !== origin || e.data?.type !== "eb-proxy-ready" || e.data.tunnelId !== p.webId) return;
       const source = e.source as Window | null;
       if (!source || (source !== frame.current?.contentWindow && !popups.current.has(source))) return;
-      const key = await p.session.webKey(p.webId);
-      const target = p.session.webs.get(p.webId)?.target;
-      if (key && target) source.postMessage({ type: "eb-proxy-key", tunnelId: p.webId, key, target: target.url }, origin);
+      // The boot page asks again every 250 ms until it gets an answer: one ticket per page, not per ask.
+      if (answering.has(source)) return;
+      answering.add(source);
+      try {
+        const key = await p.session.webKey(p.webId);
+        const target = p.session.webs.get(p.webId)?.target;
+        if (!key || !target) return;
+        let ticket: string | undefined;
+        if (subdomain) {
+          try {
+            ticket = (await api.post<{ ticket: string }>(`/tunnels/${p.webId}/ticket`)).ticket;
+          } catch {
+            return; // no access any more: the boot page keeps waiting and says so
+          }
+        }
+        source.postMessage({ type: "eb-proxy-key", tunnelId: p.webId, key, target: target.url, ...(ticket ? { ticket } : {}) }, origin);
+      } finally {
+        answering.delete(source);
+      }
     };
     window.addEventListener("message", onMessage);
     return () => window.removeEventListener("message", onMessage);
-  }, [base, p.session, p.webId]);
+  }, [where, p.session, p.webId]);
 
   // Keep wheel and keys inside the page instead of the canvas.
   useEffect(() => {
@@ -56,7 +86,7 @@ export function WebEmbed(p: { session: BoardSession; webId: string; active: bool
     };
   }, []);
 
-  const url = base ? `${base}/t/${p.webId}/` : null;
+  const url = where?.url ?? null;
   const target = info?.target;
   const label = p.title || target?.machine || "Site web";
 
@@ -105,6 +135,8 @@ export function WebEmbed(p: { session: BoardSession; webId: string; active: bool
       <div className="term-body web-body">
         {!info ? (
           <div className="term-veil">Tunnel introuvable (fermé, ou appartenant à un autre tableau).</div>
+        ) : where && !url ? (
+          <div className="term-veil">Ce tunnel date d'avant le passage aux sous-domaines : ferme-le et recrée-le.</div>
         ) : !url ? (
           <div className="term-veil">Chargement…</div>
         ) : (

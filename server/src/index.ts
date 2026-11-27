@@ -1,13 +1,12 @@
 import { existsSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import express, { type Request, type Response, type NextFunction } from "express";
-import { isIPv6 } from "node:net";
 import { WebSocketServer, type WebSocket } from "ws";
 import type { IncomingMessage } from "node:http";
 import type { Duplex } from "node:stream";
 import { config } from "./config.ts";
 import { currentSessionHash, pruneSessions, userFromRequest } from "./auth.ts";
-import { HttpError, publicUrl } from "./http.ts";
+import { HttpError, publicUrl, clientNet } from "./http.ts";
 import { announceSetup, authApi } from "./api/auth.ts";
 import { itemsApi } from "./api/items.ts";
 import { publicApi } from "./api/links.ts";
@@ -19,6 +18,7 @@ import { authenticateAgent, handleAgent } from "./terminals.ts";
 import { installScript, uninstallScript, updateScript } from "./install.ts";
 import { pairScript, pairingAgentApi, pairingOwnerApi } from "./api/pairing.ts";
 import { accountApi } from "./api/account.ts";
+import { tunnelsApi } from "./api/tunnels.ts";
 import { proxyUrl, startProxy } from "./proxy.ts";
 import { MANIFEST_FILE, latestRelease } from "./agentUpdate.ts";
 import { certificatePem, initTls, pinFor, serve, tlsInfo } from "./tls.ts";
@@ -43,18 +43,24 @@ const CSP = [
   "frame-ancestors 'none'",
 ].join("; ");
 
+/** Where tunnelled sites may be framed from: any tunnel subdomain, or the single proxy origin. */
+function tunnelFrameSource(req: Request): string {
+  const { domain, scheme } = config.tunnel;
+  if (domain) return `${scheme}://*.${domain}${scheme === "http" ? ":*" : ""}`;
+  return new URL(proxyUrl(req)).origin;
+}
+
 const app = express();
 app.set("trust proxy", config.trustProxy);
 app.disable("x-powered-by");
 // Rate limits key on req.ip. One IPv6 subscriber usually holds a whole /64: counted as one address.
 app.use((req, _res, next) => {
-  const ip = req.ip;
-  if (ip && isIPv6(ip) && !/^::ffff:/i.test(ip)) Object.defineProperty(req, "ip", { value: ipv6Net64(ip) });
+  if (req.ip) Object.defineProperty(req, "ip", { value: clientNet(req.ip) });
   next();
 });
 app.use((req, res, next) => {
   res.set({
-    "Content-Security-Policy": CSP.replace("__PROXY__", new URL(proxyUrl(req)).origin),
+    "Content-Security-Policy": CSP.replace("__PROXY__", tunnelFrameSource(req)),
     "X-Content-Type-Options": "nosniff",
     "Referrer-Policy": "no-referrer",
     "X-Frame-Options": "DENY",
@@ -87,6 +93,8 @@ app.get("/healthz", (_req, res) => {
 app.get("/api/config", (req, res) => {
   res.json({
     proxyUrl: proxyUrl(req),
+    tunnelDomain: config.tunnel.domain || null,
+    tunnelScheme: config.tunnel.scheme,
     emailVerification: !!(config.smtp.host || config.smtp.transport === "log"),
     contactEmail: config.contactEmail || null,
     legalName: config.legalName || null,
@@ -111,6 +119,7 @@ app.use("/api/machines", small, machinesApi);
 app.use("/api/pair", small, pairingAgentApi);
 app.use("/api/admin", small, adminApi);
 app.use("/api/account", small, accountApi);
+app.use("/api/tunnels", small, tunnelsApi);
 app.use("/api/public", publicApi);
 app.use("/api", (req, res, next) => (userFromRequest(req) ? large : small)[0]!(req, res, next), withBody, itemsApi);
 app.use("/api", (_req, res) => {
@@ -239,15 +248,6 @@ function upgrade(req: IncomingMessage, socket: Duplex, head: Buffer): void {
   }
 
   reject(404, "Not Found");
-}
-
-/** "2001:db8:1:2:a:b:c:d" → "2001:db8:1:2::" (still an address, for ipPrefix and the logs). */
-function ipv6Net64(ip: string): string {
-  const [head, tail = ""] = ip.split("%")[0]!.split("::");
-  const h = head ? head.split(":") : [];
-  const t = tail ? tail.split(":") : [];
-  const groups = ip.includes("::") ? [...h, ...Array(Math.max(0, 8 - h.length - t.length)).fill("0"), ...t] : h;
-  return groups.slice(0, 4).join(":") + "::";
 }
 
 let shuttingDown = false;

@@ -5,6 +5,7 @@ import type { Request, Response, NextFunction } from "express";
 import { db, serverSecret } from "./db.ts";
 import { config } from "./config.ts";
 import { tlsOn } from "./tls.ts";
+import { dropMainSessionTunnels } from "./tunnelSessions.ts";
 
 export type User = {
   id: string;
@@ -206,7 +207,10 @@ export function currentSessionHash(req: IncomingMessage): string | undefined {
 
 export function destroySession(req: Request, res: Response): void {
   const hash = currentSessionHash(req);
-  if (hash) db.prepare("DELETE FROM sessions WHERE token_hash = ?").run(hash);
+  if (hash) {
+    db.prepare("DELETE FROM sessions WHERE token_hash = ?").run(hash);
+    dropMainSessionTunnels(hash);
+  }
   res.clearCookie(COOKIE, { path: "/" });
   res.clearCookie(SECURE_COOKIE, { path: "/", secure: true });
 }

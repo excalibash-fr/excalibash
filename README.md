@@ -78,6 +78,10 @@ Les variables se placent dans un fichier `.env` à côté de `docker-compose.yml
 |---|---|---|
 | `PUBLIC_URL` | URL de la requête | URL publique, utilisée dans les commandes d'installation de l'agent |
 | `PROXY_URL` | même hôte, port 6768 | URL publique de l'origine séparée des tunnels web |
+| `TUNNEL_DOMAIN` | vide | active le mode sous-domaine : chaque tunnel web est servi sur `https://<id>.<TUNNEL_DOMAIN>/` (voir « Un sous-domaine par tunnel »). Vide : un seul port, `/t/<id>/` |
+| `TUNNEL_PROXY_SECRET` | vide | secret partagé avec le reverse proxy des tunnels (`X-Tunnel-Auth`), 32 caractères au moins. Obligatoire avec `TUNNEL_DOMAIN`, ainsi que `PUBLIC_URL` |
+| `TUNNEL_SCHEME` | `https` | `http` seulement pour des essais locaux |
+| `TUNNEL_SESSION_HOURS` | `8` | durée de la session d'un tunnel dans un navigateur |
 | `TLS` | `auto` | `auto` : HTTPS sur les deux ports, avec le certificat fourni ou un certificat auto-signé. `off` : HTTP seul, derrière un reverse proxy qui fait le TLS |
 | `TLS_CERT` `TLS_KEY` | vide | chemins PEM d'un certificat fourni (Let's Encrypt, PKI interne), utilisé à la place du certificat auto-signé |
 | `TLS_SANS` | vide | noms ou adresses IP supplémentaires du certificat auto-signé, séparés par des virgules |
@@ -133,6 +137,44 @@ PROXY_URL=https://tunnel.example.com
 TLS=off
 COOKIE_SECURE=true
 ```
+
+### Un sous-domaine par tunnel
+
+Optionnel : avec `TUNNEL_DOMAIN`, chaque tunnel a sa propre origine (`https://<id>.tunnel.example.com/`) : les sites voient leurs vrais chemins, ne partagent ni stockage ni cookies, et connaître une adresse ne suffit plus à joindre le relais. Sans `TUNNEL_DOMAIN`, rien ne change (tunnels en `/t/<id>/`), ce qui convient aux instances sans DNS wildcard.
+
+Il faut un enregistrement DNS `*.tunnel.example.com`, un certificat wildcard, et un reverse proxy qui envoie les sous-domaines au port 6768 en y ajoutant les deux en-têtes ci-dessous (en écrasant ceux du client). `TUNNEL_DOMAIN` doit être sous le même domaine que `PUBLIC_URL`, et le port 6768 ne doit être joignable que par ce proxy.
+
+```dotenv
+PUBLIC_URL=https://excalibash.example.com
+TUNNEL_DOMAIN=tunnel.example.com
+TUNNEL_PROXY_SECRET=une-longue-valeur-aleatoire-d-au-moins-32-caracteres
+TLS=off
+COOKIE_SECURE=true
+```
+
+```nginx
+map $http_upgrade $connection_upgrade { default upgrade; "" close; }
+
+server {
+  listen 443 ssl;
+  server_name *.tunnel.example.com;
+  # ssl_certificate / ssl_certificate_key : certificat wildcard
+  client_max_body_size 64m;
+  location / {
+    proxy_pass http://127.0.0.1:6768;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Tunnel-Host $host;
+    proxy_set_header X-Tunnel-Auth "<TUNNEL_PROXY_SECRET>";
+    proxy_set_header X-Forwarded-For $remote_addr;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection $connection_upgrade;
+  }
+}
+```
+
+`proxy_set_header` remplace les en-têtes du même nom envoyés par le client. Avec BunkerWeb, ajouter les mêmes en-têtes au reverse proxy du service `*.tunnel.example.com`. Les tunnels créés avant ce mode (identifiants plus anciens) ne s'ouvrent pas en sous-domaine : les fermer et les recréer. Détails de sécurité : [docs/SECURITY.md](docs/SECURITY.md).
 
 Par défaut, `docker-compose.yml` ne publie les ports 6767 et 6768 que sur `127.0.0.1` : seul le reverse proxy, en 80 et 443, est exposé. Le volume `excalibash-data` contient toutes les données ; son contenu est chiffré.
 

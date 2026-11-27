@@ -2,7 +2,7 @@ import { CaptureUpdateAction, reconcileElements, restoreElements } from "@excali
 import type { ExcalidrawImperativeAPI, Collaborator, SocketId, BinaryFiles, AppState } from "@excalidraw/excalidraw/types";
 import type { OrderedExcalidrawElement } from "@excalidraw/excalidraw/element/types";
 import type { Entry, RemoteTarget, Role, TerminalInfo, WebInfo, WebTarget } from "../api.ts";
-import { AAD, box, boxJson, boxText, newSymKey, randomId, toB64, unbox, unboxJson, unboxText, unwrapKey, utf8, wrapKey, type SymKey } from "../crypto.ts";
+import { AAD, box, boxJson, boxText, newSymKey, randomId, randomTunnelId, toB64, unbox, unboxJson, unboxText, unwrapKey, utf8, wrapKey, type SymKey } from "../crypto.ts";
 import { discardDocs, docIds } from "./docGc.ts";
 import { decryptEntry, decryptFile, decryptPointer, encryptEntry, encryptFile, encryptPointer } from "./boardCrypto.ts";
 
@@ -646,7 +646,7 @@ export class BoardSession {
    * owner-only machine auth key, so neither the server nor anyone else can redirect it.
    */
   async createWeb(machine: { id: string; name: string; auth: SymKey }, target: Omit<WebTarget, "machine">): Promise<WebInfo> {
-    const id = randomId();
+    const id = randomTunnelId();
     const kw = await newSymKey();
     const full: WebTarget = { ...target, machine: machine.name };
     const frame = {

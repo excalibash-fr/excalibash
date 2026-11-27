@@ -556,7 +556,7 @@ new WebSocketServer({ server: site, handleProtocols: (p: Set<string>) => (p.has(
 });
 await new Promise<void>((r) => site.listen(0, "127.0.0.1", () => r()));
 const sitePort = (site.address() as any).port;
-const wid = c.randomId();
+const wid = c.randomTunnelId();
 const kwA = await c.newSymKey();
 const siteUrl = `http://127.0.0.1:${sitePort}`;
 sa.send({

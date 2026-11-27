@@ -2,6 +2,7 @@ import { Router } from "express";
 import { db } from "../db.ts";
 import { currentSessionHash, destroySession, rateLimit, requireUser, verifySecret, getUserRow } from "../auth.ts";
 import { kickSession } from "../rooms.ts";
+import { dropMainSessionTunnels, dropUserTunnelSessions } from "../tunnelSessions.ts";
 import { HttpError, blob } from "../http.ts";
 import { purgeUser } from "./admin.ts";
 import { emailEnabled } from "../mailer.ts";
@@ -73,6 +74,7 @@ accountApi.post("/sessions/revoke-others", (req, res) => {
   const cur = currentSessionHash(req) ?? "";
   const others = db.prepare("SELECT token_hash FROM sessions WHERE user_id = ? AND token_hash != ?").all(req.user!.id, cur) as { token_hash: string }[];
   db.prepare("DELETE FROM sessions WHERE user_id = ? AND token_hash != ?").run(req.user!.id, cur);
+  dropUserTunnelSessions(req.user!.id, cur);
   for (const o of others) kickSession(o.token_hash, 4001, "session terminée");
   res.json({ ok: true, revoked: others.length });
 });
@@ -84,6 +86,7 @@ accountApi.delete("/sessions/:id", (req, res) => {
     | undefined;
   if (!row) throw new HttpError(404, "Session introuvable");
   db.prepare("DELETE FROM sessions WHERE token_hash = ?").run(row.token_hash);
+  dropMainSessionTunnels(row.token_hash);
   kickSession(row.token_hash, 4001, "session terminée");
   res.json({ ok: true, current: row.token_hash === currentSessionHash(req) });
 });

@@ -1,3 +1,4 @@
+import { isIPv6 } from "node:net";
 import type { Request } from "express";
 import { config } from "./config.ts";
 import { knownHostnames } from "./tls.ts";
@@ -45,3 +46,15 @@ export function mailLink(req: Request, path: string, label: string): MailLink | 
   }
   return undefined;
 }
+
+/** "2001:db8:1:2:a:b:c:d" → "2001:db8:1:2::" (still an address, for ipPrefix and the logs). */
+function ipv6Net64(ip: string): string {
+  const [head, tail = ""] = ip.split("%")[0]!.split("::");
+  const h = head ? head.split(":") : [];
+  const t = tail ? tail.split(":") : [];
+  const groups = ip.includes("::") ? [...h, ...Array(Math.max(0, 8 - h.length - t.length)).fill("0"), ...t] : h;
+  return groups.slice(0, 4).join(":") + "::";
+}
+
+/** The address rate limits count: IPv6 clients are grouped by /64 (one subscriber usually holds a whole one). */
+export const clientNet = (ip: string): string => (isIPv6(ip) && !/^::ffff:/i.test(ip) ? ipv6Net64(ip) : ip);

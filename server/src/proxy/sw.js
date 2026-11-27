@@ -6,6 +6,10 @@
 
 const MAIN_ORIGIN = "__MAIN_ORIGIN__";
 const ID = /^[A-Za-z0-9_-]{16,43}$/;
+// Subdomain mode: the tunnel of this origin, set by the server from the verified host (empty in path mode,
+// where the id is the first segment of /t/<id>/…). The site then lives at the root, with its real paths.
+const HOST_ID = "__TUNNEL_ID__";
+const mount = (id) => (HOST_ID ? "" : "/t/" + id);
 const enc = new TextEncoder();
 const dec = new TextDecoder();
 
@@ -133,6 +137,7 @@ self.addEventListener("message", (e) => {
 const clientTunnel = new Map(); // clientId -> tunnel id
 
 function prefixed(url) {
+  if (HOST_ID) return { id: HOST_ID, path: url.pathname + url.search, unprefixed: true };
   const m = url.pathname.match(/^\/t\/([^/]+)(\/.*)?$/);
   return m && ID.test(m[1]) ? { id: m[1], path: (m[2] || "/") + url.search } : null;
 }
@@ -171,7 +176,7 @@ async function handle(e, url) {
   // that already starts with it loses it, else a target http://host/app would get /app/app/….
   if (route.unprefixed && t) route.path = underBase(route.path, t.target);
   // Keep navigations under /t/<id>/ so every page knows its tunnel.
-  if (route.unprefixed && e.request.mode === "navigate") return Response.redirect(`/t/${route.id}${route.path}`, 302);
+  if (route.unprefixed && !HOST_ID && e.request.mode === "navigate") return Response.redirect(`/t/${route.id}${route.path}`, 302);
   if (!t) return fetch(e.request); // no key yet: the boot page will fetch it
   if (e.request.mode === "navigate" && e.resultingClientId) clientTunnel.set(e.resultingClientId, route.id);
 
@@ -182,7 +187,8 @@ async function handle(e, url) {
   if (cookie) headers.cookie = [cookie];
   // The site sees itself, not the proxy origin.
   if (headers.origin) headers.origin = [t.target.origin];
-  if (headers.referer) headers.referer = [headers.referer[0].replace(new RegExp(`^${self.location.origin}/t/${route.id}`), t.target.origin + basePath(t.target))];
+  const own = self.location.origin + mount(route.id);
+  if (headers.referer && headers.referer[0].startsWith(own)) headers.referer = [t.target.origin + basePath(t.target) + headers.referer[0].slice(own.length)];
   const body = ["GET", "HEAD"].includes(e.request.method) ? new Uint8Array() : new Uint8Array(await e.request.arrayBuffer());
 
   const rid = b64(crypto.getRandomValues(new Uint8Array(16)));
@@ -191,6 +197,11 @@ async function handle(e, url) {
   let reply;
   try {
     const r = await fetch(`/eb-proxy/req/${route.id}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ rid, ts, d }) });
+    if (HOST_ID && r.status === 404) {
+      // Session expired or server restarted: a page load goes back through the boot page to shake hands again.
+      if (e.request.mode === "navigate") return fetch(e.request);
+      return new Response(null, { status: 404, headers: { "cache-control": "no-store" } });
+    }
     if (!r.ok) return errorPage(r.status === 404 ? "Ce tunnel n'existe plus." : "La machine est hors ligne ou ne répond pas.");
     reply = await r.json();
   } catch {
@@ -233,7 +244,7 @@ function withWebSocketShim(bytes, id, origin) {
   if (/^\s*(\xff\xfe|\xfe\xff|\x00)/.test(head)) return bytes; // UTF-16 page
   const m = /<head(\s[^>]*)?>/i.exec(head) || /<html(\s[^>]*)?>/i.exec(head) || /^\s*<!doctype[^>]*>/i.exec(head);
   const at = m ? m.index + m[0].length : 0;
-  const tag = enc.encode(`<script src="/eb-proxy/ws-shim.js" data-eb-tunnel="${id}" data-eb-target="${origin}"></script>`);
+  const tag = enc.encode(`<script src="/eb-proxy/ws-shim.js" data-eb-tunnel="${id}" data-eb-mount="${mount(id)}" data-eb-target="${origin}"></script>`);
   const out = new Uint8Array(bytes.length + tag.length);
   out.set(bytes.subarray(0, at));
   out.set(tag, at);
@@ -255,7 +266,7 @@ function rewriteLocation(loc, id, target) {
   try {
     const u = new URL(loc, target);
     if (u.origin !== target.origin) return loc;
-    return `/t/${id}${underBase(u.pathname, target)}${u.search}${u.hash}`;
+    return `${mount(id)}${underBase(u.pathname, target)}${u.search}${u.hash}`;
   } catch {
     return loc;
   }

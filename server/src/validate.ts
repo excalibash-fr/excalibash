@@ -6,6 +6,9 @@ export const isB64Url = (v: unknown, max = Infinity): v is string => typeof v ==
 /** Client-generated ids (bound into ciphertext AADs): 12 to 32 random bytes, base64url. */
 export const isClientId = (v: unknown): v is string => typeof v === "string" && /^[A-Za-z0-9_-]{16,43}$/.test(v);
 
+/** Tunnel id: 128 random bits in lowercase base32 (RFC 4648, no padding), usable as a DNS label. */
+export const isTunnelId = (v: unknown): v is string => typeof v === "string" && /^[a-z2-7]{26}$/.test(v);
+
 /** 128-bit random id, base64url without padding. */
 export const isId22 = (v: unknown): v is string => typeof v === "string" && /^[A-Za-z0-9_-]{22}$/.test(v);
 
