@@ -49,6 +49,9 @@ const ALLOWED_CONSOLE: RegExp[] = [
   /Blocked script execution in 'about:srcdoc'/,
   // Logged out (or not yet unlocked) pages ask /api/auth/me: the 401 is the expected answer.
   /Failed to load resource: the server responded with a status of 401/,
+  // Excalidraw listens to window "unload", which recent Chrome versions deny by default (unload deprecation):
+  // the browser reports it, nothing breaks.
+  /Permissions policy violation: unload is not allowed in this document/,
 ];
 
 const problems: string[] = [];

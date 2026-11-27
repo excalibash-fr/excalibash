@@ -90,15 +90,15 @@ class Service<R extends ExecRunner = ExecRunner> {
   disposed = false;
   private offs: (() => void)[] = [];
   private idleTimer: ReturnType<typeof setTimeout> | undefined;
+  // Plain fields, not parameter properties: the tests run this file with Node's type stripping, which refuses them.
+  private owner: Map<string, Service<any>>;
+  private docId: string;
+  private idleMs: number;
 
-  constructor(
-    private owner: Map<string, Service<any>>,
-    private docId: string,
-    kind: Kind<R>,
-    host: DocHost,
-    env: ServiceEnv,
-    private idleMs: number,
-  ) {
+  constructor(owner: Map<string, Service<any>>, docId: string, kind: Kind<R>, host: DocHost, env: ServiceEnv, idleMs: number) {
+    this.owner = owner;
+    this.docId = docId;
+    this.idleMs = idleMs;
     this.doc = openSharedDoc(host, docId);
     this.runner = kind.make(this.doc, env.port, host.canEdit && !this.doc.readOnly);
     const meta = metaOf(this.doc.ydoc);
