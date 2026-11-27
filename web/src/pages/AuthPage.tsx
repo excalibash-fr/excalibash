@@ -3,7 +3,7 @@ import { Link, Navigate, useNavigate, useSearchParams } from "react-router-dom";
 import { Download, KeyRound, Loader2, LockKeyhole, MailCheck, ShieldCheck } from "lucide-react";
 import { api, ApiError, type User } from "../api.ts";
 import { useAuth } from "../auth.tsx";
-import { checkCode, login, recover, register, resendCode, unlock, verifyEmail, type Session } from "../account.ts";
+import { checkCode, login, recover, register, resendCode, unlock, verifyEmail, type MfaStep, type Session } from "../account.ts";
 import type { KeyPair } from "../crypto.ts";
 import { Logo, copyText } from "../components/ui.tsx";
 import { saveBlob } from "../download.ts";
@@ -26,6 +26,8 @@ export function AuthPage({ mode }: { mode: Mode }) {
   const [website, setWebsite] = useState("");
   // Email step: after sign-up (keys + recovery key in memory) or after a login refused for an unverified email.
   const [verifying, setVerifying] = useState<{ email: string; keys?: KeyPair; recoveryKey?: string; password?: string } | null>(null);
+  // Second-factor step: after the password (or the recovery key) of an account that has one. `to` is where to go next.
+  const [mfa, setMfa] = useState<{ step: MfaStep; to: string } | null>(null);
 
   useEffect(() => {
     api.get<Status>("/auth/status").then(setStatus).catch(() => {});
@@ -57,11 +59,28 @@ export function AuthPage({ mode }: { mode: Mode }) {
           } else {
             await checkCode(verifying.email, code);
             const s = await login(verifying.email, verifying.password ?? "");
+            if ("mfaRequired" in s) {
+              setMfa({ step: s, to: next });
+              setVerifying(null);
+              return;
+            }
             signedIn(s.user, s.keys);
             navigate(next, { replace: true });
           }
         }}
         onBack={() => setVerifying(null)}
+      />
+    );
+  }
+  if (mfa) {
+    return (
+      <MfaScreen
+        onSubmit={async (code) => {
+          const s = await mfa.step.finish(code);
+          signedIn(s.user, s.keys);
+          navigate(mfa.to, { replace: true });
+        }}
+        onBack={() => setMfa(null)}
       />
     );
   }
@@ -87,10 +106,18 @@ export function AuthPage({ mode }: { mode: Mode }) {
         else setPending(r);
       } else if (mode === "recover") {
         const s = await recover(form.email, form.recoveryKey, form.password);
+        if ("mfaRequired" in s) {
+          setMfa({ step: s, to: "/" });
+          return;
+        }
         signedIn(s.user, s.keys);
         navigate("/", { replace: true });
       } else {
         const s = await login(form.email, form.password);
+        if ("mfaRequired" in s) {
+          setMfa({ step: s, to: next });
+          return;
+        }
         signedIn(s.user, s.keys);
         navigate(next, { replace: true });
       }
@@ -297,6 +324,92 @@ function VerifyScreen({ email, onSubmit, onBack }: { email: string; onSubmit: (c
             }}
           >
             {wait > 0 ? `Renvoyer le code (${wait} s)` : "Renvoyer le code"}
+          </button>
+          <button className="link" style={{ background: "none", border: 0, cursor: "pointer" }} onClick={onBack}>
+            Retour
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/** Second factor: the 6-digit code of the authenticator app, or one of the backup codes. */
+function MfaScreen({ onSubmit, onBack }: { onSubmit: (code: string) => Promise<void>; onBack: () => void }) {
+  const [code, setCode] = useState("");
+  const [backup, setBackup] = useState(false);
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+  const ready = backup ? code.replace(/[^A-Za-z0-9]/g, "").length === 10 : code.length === 6;
+  return (
+    <div className="auth">
+      <div className="auth-card">
+        <ShieldCheck size={44} style={{ color: "var(--brand)" }} />
+        <h1 className="display">Code de vérification</h1>
+        <p className="hint">
+          {backup
+            ? "Entre l'un de tes codes de secours. Chacun ne sert qu'une fois."
+            : "Entre le code à 6 chiffres affiché par ton application d'authentification."}
+        </p>
+        <form
+          onSubmit={async (e) => {
+            e.preventDefault();
+            setBusy(true);
+            setError("");
+            try {
+              await onSubmit(code.trim());
+            } catch (err) {
+              setError(err instanceof Error ? err.message : String(err));
+              setBusy(false);
+            }
+          }}
+        >
+          <label className="field">
+            {backup ? "Code de secours" : "Code"}
+            {backup ? (
+              <input
+                key="backup"
+                className="input mono"
+                placeholder="XXXXX-XXXXX"
+                autoComplete="off"
+                spellCheck={false}
+                maxLength={11}
+                required
+                autoFocus
+                value={code}
+                onChange={(e) => setCode(e.target.value.toUpperCase())}
+              />
+            ) : (
+              <input
+                key="totp"
+                className="input mono"
+                inputMode="numeric"
+                autoComplete="one-time-code"
+                pattern="[0-9]{6}"
+                maxLength={6}
+                required
+                autoFocus
+                value={code}
+                onChange={(e) => setCode(e.target.value.replace(/\D/g, ""))}
+              />
+            )}
+          </label>
+          {error && <div className="form-error">{error}</div>}
+          <button className="btn btn-primary" disabled={busy || !ready} style={{ height: 44 }}>
+            {busy ? <Loader2 size={16} className="spin" /> : "Valider"}
+          </button>
+        </form>
+        <div className="hint" style={{ marginTop: 16, textAlign: "center", display: "grid", gap: 6 }}>
+          <button
+            className="link"
+            style={{ background: "none", border: 0, cursor: "pointer" }}
+            onClick={() => {
+              setBackup(!backup);
+              setCode("");
+              setError("");
+            }}
+          >
+            {backup ? "Utiliser le code de l'application" : "Utiliser un code de secours"}
           </button>
           <button className="link" style={{ background: "none", border: 0, cursor: "pointer" }} onClick={onBack}>
             Retour

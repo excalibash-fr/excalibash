@@ -2,8 +2,8 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { Navigate } from "react-router-dom";
 import { formatDistanceToNow } from "date-fns";
 import { fr } from "date-fns/locale";
-import { Ban, Link2, Loader2, Lock, Mail, RotateCcw, Search, Send, Shield, Trash2 } from "lucide-react";
-import { api } from "../api.ts";
+import { Ban, Link2, Loader2, Lock, Mail, RotateCcw, Search, Send, Shield, ShieldCheck, ShieldOff, Trash2 } from "lucide-react";
+import { api, ApiError } from "../api.ts";
 import { useUser } from "../auth.tsx";
 import "./admin.css";
 import { Avatar, Modal, Switch, confirmDialog, copyText, toast } from "../components/ui.tsx";
@@ -17,6 +17,7 @@ type AdminUser = {
   createdAt: number;
   emailVerified: boolean;
   suspended: boolean;
+  mfaEnabled: boolean;
   lastSeenAt: number | null;
   boards: number;
   folders: number;
@@ -40,7 +41,7 @@ type Stats = {
   signupsLast7Days: number;
 };
 type Invite = { id: string; note: string | null; expiresAt: number; createdAt: number; usedBy: string | null };
-type Data = { users: AdminUser[]; invites: Invite[]; stats: Stats; registrationOpen: boolean; emailVerification: boolean };
+type Data = { users: AdminUser[]; invites: Invite[]; stats: Stats; registrationOpen: boolean; emailVerification: boolean; mfaRequiredAdmins: boolean };
 type Sort = "storage" | "seen" | "created";
 type MailOutcome = { at: number; ok: boolean; error?: string };
 type Smtp = {
@@ -80,10 +81,14 @@ export function Admin() {
   const [testing, setTesting] = useState(false);
   const [testResult, setTestResult] = useState<{ ok: boolean; text: string } | null>(null);
 
+  // MFA required for admins and none on this account: the account page explains how to turn it on.
+  const [needMfa, setNeedMfa] = useState(false);
+  const fail = useCallback((e: unknown) => (e instanceof ApiError && e.code === "MFA_REQUIRED" ? setNeedMfa(true) : toast.error(e)), []);
+
   const load = useCallback(() => {
-    api.get<Data>("/admin").then(setData).catch(toast.error);
-    api.get<Smtp>("/admin/smtp").then(setSmtp).catch(toast.error);
-  }, []);
+    api.get<Data>("/admin").then(setData).catch(fail);
+    api.get<Smtp>("/admin/smtp").then(setSmtp).catch(fail);
+  }, [fail]);
   useEffect(load, [load]);
 
   const users = useMemo(() => {
@@ -94,6 +99,7 @@ export function Admin() {
   }, [data, query, sort]);
 
   if (!me.isAdmin) return <Navigate to="/" replace />;
+  if (needMfa) return <Navigate to="/account?mfa=required" replace />;
 
   const setRegistration = async (open: boolean) => {
     await api.patch("/admin/settings", { registrationOpen: open }).catch(toast.error);
@@ -102,6 +108,24 @@ export function Admin() {
 
   const setVerification = async (on: boolean) => {
     await api.patch("/admin/settings", { emailVerification: on }).catch(toast.error);
+    load();
+  };
+
+  const setMfaRequired = async (on: boolean) => {
+    await api.patch("/admin/settings", { mfaRequiredAdmins: on }).catch(toast.error);
+    load();
+  };
+
+  const resetMfa = async (u: AdminUser) => {
+    const ok = await confirmDialog({
+      title: `Réinitialiser la double authentification de ${u.name} ?`,
+      text: "Elle est désactivée et ses codes de secours sont supprimés : la personne ne se connecte plus qu'avec son mot de passe, jusqu'à ce qu'elle la réactive. À faire seulement si elle a perdu son appareil et ses codes.",
+      confirm: "Réinitialiser",
+      danger: true,
+    });
+    if (!ok) return;
+    await api.post(`/admin/users/${u.id}/mfa-reset`).catch(toast.error);
+    toast("Double authentification réinitialisée");
     load();
   };
 
@@ -230,6 +254,24 @@ export function Admin() {
       <div className="panel">
         <div className="panel-head">
           <h3>
+            <ShieldCheck size={16} /> Sécurité
+          </h3>
+        </div>
+        <div className="row">
+          <div className="grow">
+            <div className="title">MFA obligatoire pour les administrateurs</div>
+            <div className="sub">
+              Un administrateur sans double authentification garde son compte mais perd l'accès à cette page tant qu'il ne l'a pas activée. Il faut l'avoir
+              activée soi-même pour pouvoir allumer ce réglage.
+            </div>
+          </div>
+          {data && <Switch on={data.mfaRequiredAdmins} onChange={setMfaRequired} label="MFA obligatoire pour les administrateurs" />}
+        </div>
+      </div>
+
+      <div className="panel">
+        <div className="panel-head">
+          <h3>
             <Mail size={16} /> Emails (SMTP)
           </h3>
           {smtp && (
@@ -327,6 +369,7 @@ export function Admin() {
                 {u.name} {!!u.isAdmin && <span className="badge">admin</span>}
                 {!u.emailVerified && <span className="badge">non vérifié</span>}
                 {u.suspended && <span className="badge admin-badge-off">suspendu</span>}
+                {u.mfaEnabled && <span className="badge" title="Double authentification activée">MFA</span>}
               </div>
               <div className="sub">{u.email}</div>
             </div>
@@ -357,6 +400,11 @@ export function Admin() {
                 <button className="btn btn-sm btn-icon" title={u.suspended ? "Réactiver" : "Suspendre"} onClick={() => toggleSuspend(u)}>
                   {u.suspended ? <RotateCcw size={16} /> : <Ban size={16} />}
                 </button>
+                {u.mfaEnabled && (
+                  <button className="btn btn-sm btn-icon" title="Réinitialiser la double authentification" onClick={() => resetMfa(u)}>
+                    <ShieldOff size={16} />
+                  </button>
+                )}
                 <button className="btn btn-sm btn-icon" title={u.isAdmin ? "Retirer admin" : "Rendre admin"} onClick={() => toggleAdmin(u)}>
                   <Shield size={16} />
                 </button>

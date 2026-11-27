@@ -1,11 +1,13 @@
 import { useEffect, useState } from "react";
-import { useNavigate, Link } from "react-router-dom";
+import { useNavigate, useSearchParams, Link } from "react-router-dom";
 import { formatDistanceToNow } from "date-fns";
 import { fr } from "date-fns/locale";
-import { Bell, Check, EyeOff, Fingerprint, KeyRound, Loader2, MonitorSmartphone, Palette, Trash2 } from "lucide-react";
+import { Bell, Check, Download, EyeOff, Fingerprint, KeyRound, Loader2, MonitorSmartphone, Palette, ShieldCheck, Trash2 } from "lucide-react";
 import { api, type User } from "../api.ts";
 import { useAuth, useKeys, useUser } from "../auth.tsx";
-import { changePassword, forgetKeys } from "../account.ts";
+import { authKeyFor, changePassword, forgetKeys } from "../account.ts";
+import { saveBlob } from "../download.ts";
+import { QrCode } from "../components/QrCode.tsx";
 import { deriveAccountKeys, fingerprint } from "../crypto.ts";
 import { confirmDialog, copyText, toast, useTheme } from "../components/ui.tsx";
 import { CUSTOM_ID, THEMES, customFrom, customTheme, themeById, type Base, type CustomColors, type Mode, type ThemeDef } from "../themes.ts";
@@ -28,6 +30,7 @@ export function Account() {
   const keys = useKeys();
   const { setUser, logout } = useAuth();
   const navigate = useNavigate();
+  const [params] = useSearchParams();
   const [delPw, setDelPw] = useState("");
   const [delBusy, setDelBusy] = useState(false);
   const [fp, setFp] = useState("");
@@ -146,6 +149,18 @@ export function Account() {
   return (
     <>
       <h1 className="page-title display">Mon compte</h1>
+
+      {params.get("mfa") === "required" && !user.mfaEnabled && (
+        <div className="panel" role="alert">
+          <div className="row">
+            <ShieldCheck size={20} style={{ color: "var(--brand)" }} />
+            <div className="grow">
+              <div className="title">L'administration exige la double authentification</div>
+              <div className="sub">Active-la dans la section « Double authentification » ci-dessous : tu retrouveras ensuite l'accès à l'administration.</div>
+            </div>
+          </div>
+        </div>
+      )}
 
       <div className="panel">
         <div className="panel-head">
@@ -300,6 +315,8 @@ export function Account() {
         </p>
       </div>
 
+      <TwoFactor />
+
       <div className="panel">
         <div className="panel-head">
           <h3>
@@ -369,6 +386,270 @@ export function Account() {
         <Link to="/confidentialite">Confidentialité</Link>
       </p>
     </>
+  );
+}
+
+type MfaInfo = { enabled: boolean; backupCodesLeft: number; required: boolean };
+type MfaStage =
+  | { step: "idle" }
+  | { step: "password" }
+  | { step: "scan"; authKey: string; secret: string; uri: string }
+  | { step: "codes"; codes: string[] }
+  | { step: "regen" }
+  | { step: "disable" };
+
+/** Second factor: turn it on (QR code, first code, backup codes), regenerate the backup codes, turn it off. */
+function TwoFactor() {
+  const user = useUser();
+  const { setUser } = useAuth();
+  const [info, setInfo] = useState<MfaInfo | null>(null);
+  const [stage, setStage] = useState<MfaStage>({ step: "idle" });
+  const [pw, setPw] = useState("");
+  const [code, setCode] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const load = () =>
+    api
+      .get<{ mfa: MfaInfo }>("/account")
+      .then((r) => setInfo(r.mfa))
+      .catch(toast.error);
+  useEffect(() => {
+    load();
+  }, []);
+
+  const go = (next: MfaStage) => {
+    setStage(next);
+    setPw("");
+    setCode("");
+  };
+  /** Runs one action with the busy flag; errors are shown as a toast and the form stays open. */
+  const run = async (fn: () => Promise<void>) => {
+    setBusy(true);
+    try {
+      await fn();
+    } catch (err) {
+      toast.error(err);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const startSetup = (e: React.FormEvent) => {
+    e.preventDefault();
+    return run(async () => {
+      const authKey = await authKeyFor(user.email, pw);
+      const r = await api.post<{ secret: string; uri: string }>("/account/mfa/setup", { authKey });
+      go({ step: "scan", ...r, authKey });
+    });
+  };
+  const enable = (e: React.FormEvent) => {
+    e.preventDefault();
+    return run(async () => {
+      const r = await api.post<{ backupCodes: string[] }>("/account/mfa/enable", { code });
+      setUser({ ...user, mfaEnabled: true });
+      go({ step: "codes", codes: r.backupCodes });
+      load();
+    });
+  };
+  const regenerate = (e: React.FormEvent) => {
+    e.preventDefault();
+    return run(async () => {
+      const r = await api.post<{ backupCodes: string[] }>("/account/mfa/backup-codes", { code });
+      go({ step: "codes", codes: r.backupCodes });
+      load();
+    });
+  };
+  const disable = (e: React.FormEvent) => {
+    e.preventDefault();
+    return run(async () => {
+      const authKey = await authKeyFor(user.email, pw);
+      await api.post("/account/mfa/disable", { authKey, code });
+      setUser({ ...user, mfaEnabled: false });
+      go({ step: "idle" });
+      toast("Double authentification désactivée");
+      load();
+    });
+  };
+
+  const codeField = (backupAllowed: boolean) => (
+    <label className="field">
+      Code à 6 chiffres{backupAllowed ? " (ou code de secours)" : ""}
+      <input
+        className="input mono"
+        required
+        autoFocus
+        autoComplete="one-time-code"
+        inputMode={backupAllowed ? "text" : "numeric"}
+        maxLength={backupAllowed ? 11 : 6}
+        value={code}
+        onChange={(e) => setCode(backupAllowed ? e.target.value.toUpperCase() : e.target.value.replace(/\D/g, ""))}
+      />
+    </label>
+  );
+  const passwordField = (
+    <label className="field">
+      Mot de passe
+      <input className="input" type="password" required autoFocus autoComplete="current-password" value={pw} onChange={(e) => setPw(e.target.value)} />
+    </label>
+  );
+  const cancel = (
+    <button type="button" className="btn" onClick={() => go({ step: "idle" })}>
+      Annuler
+    </button>
+  );
+  const formStyle = { padding: 20, display: "grid", gap: 12, maxWidth: 420 } as const;
+  const on = user.mfaEnabled;
+
+  return (
+    <div className="panel">
+      <div className="panel-head">
+        <h3>
+          <ShieldCheck size={16} /> Double authentification
+        </h3>
+        {on && <span className="badge live">activée</span>}
+      </div>
+
+      {stage.step === "idle" && (
+        <div className="row" style={{ display: "block" }}>
+          <div className="sub" style={{ marginBottom: 12 }}>
+            {on
+              ? `À chaque connexion, un code de ton application d'authentification est demandé en plus du mot de passe. Codes de secours restants : ${info?.backupCodesLeft ?? "…"}.`
+              : "Ajoute un code à 6 chiffres, généré par une application d'authentification (FreeOTP, Aegis, Google Authenticator, un gestionnaire de mots de passe…), à demander après ton mot de passe. Ce code est vérifié par le serveur : il protège l'accès au compte, pas le chiffrement de tes données, qui reste fait dans ton navigateur."}
+          </div>
+          {on ? (
+            <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+              <button className="btn" onClick={() => go({ step: "regen" })}>
+                Régénérer les codes de secours
+              </button>
+              <button className="btn btn-danger" onClick={() => go({ step: "disable" })} disabled={info?.required}>
+                Désactiver
+              </button>
+            </div>
+          ) : (
+            <button className="btn btn-primary" onClick={() => go({ step: "password" })}>
+              Activer
+            </button>
+          )}
+          {on && info?.required && (
+            <p className="field-help" style={{ margin: "12px 0 0" }}>
+              Les administrateurs doivent garder la double authentification : elle est obligatoire sur cette instance.
+            </p>
+          )}
+        </div>
+      )}
+
+      {stage.step === "password" && (
+        <form style={formStyle} onSubmit={startSetup}>
+          <p className="sub" style={{ margin: 0 }}>
+            Pour commencer, entre ton mot de passe.
+          </p>
+          {passwordField}
+          <div style={{ display: "flex", gap: 10 }}>
+            <button className="btn btn-primary" disabled={busy || !pw}>
+              {busy ? <Loader2 size={16} className="spin" /> : "Continuer"}
+            </button>
+            {cancel}
+          </div>
+        </form>
+      )}
+
+      {stage.step === "scan" && (
+        <form style={formStyle} onSubmit={enable}>
+          <p className="sub" style={{ margin: 0 }}>
+            1. Scanne ce QR code avec ton application d'authentification (il est dessiné ici, dans ton navigateur). 2. Entre le code à 6 chiffres qu'elle affiche.
+          </p>
+          <QrCode text={stage.uri} label="QR code à scanner avec l'application d'authentification" />
+          <div>
+            <div className="sub">Pas de caméra ? Entre ce secret à la main :</div>
+            <div className="codebox" data-testid="mfa-secret" style={{ marginTop: 6 }}>
+              {stage.secret.replace(/(.{4})/g, "$1 ").trim()}
+              <button type="button" className="btn btn-ghost btn-icon btn-sm" title="Copier" onClick={() => copyText(stage.secret)}>
+                <KeyRound size={15} />
+              </button>
+            </div>
+          </div>
+          {codeField(false)}
+          <div style={{ display: "flex", gap: 10 }}>
+            <button className="btn btn-primary" disabled={busy || code.length !== 6}>
+              {busy ? <Loader2 size={16} className="spin" /> : "Activer"}
+            </button>
+            {cancel}
+          </div>
+        </form>
+      )}
+
+      {stage.step === "codes" && <BackupCodes codes={stage.codes} email={user.email} onDone={() => go({ step: "idle" })} />}
+
+      {stage.step === "regen" && (
+        <form style={formStyle} onSubmit={regenerate}>
+          <p className="sub" style={{ margin: 0 }}>
+            Les 10 nouveaux codes remplacent les anciens, qui ne marcheront plus. Entre un code de l'application (ou un code de secours) pour confirmer.
+          </p>
+          {codeField(true)}
+          <div style={{ display: "flex", gap: 10 }}>
+            <button className="btn btn-primary" disabled={busy || !code}>
+              {busy ? <Loader2 size={16} className="spin" /> : "Régénérer"}
+            </button>
+            {cancel}
+          </div>
+        </form>
+      )}
+
+      {stage.step === "disable" && (
+        <form style={formStyle} onSubmit={disable}>
+          <p className="sub" style={{ margin: 0 }}>
+            Ton compte ne sera plus protégé que par ton mot de passe. Entre-le, avec un code de l'application (ou un code de secours).
+          </p>
+          {passwordField}
+          {codeField(true)}
+          <div style={{ display: "flex", gap: 10 }}>
+            <button className="btn btn-danger" disabled={busy || !pw || !code}>
+              {busy ? <Loader2 size={16} className="spin" /> : "Désactiver"}
+            </button>
+            {cancel}
+          </div>
+        </form>
+      )}
+    </div>
+  );
+}
+
+/** The backup codes, shown once: copy or download them before closing. */
+function BackupCodes({ codes, email, onDone }: { codes: string[]; email: string; onDone: () => void }) {
+  const [saved, setSaved] = useState(false);
+  const text = codes.join("\n");
+  const download = () =>
+    saveBlob(
+      new Blob([`Excalibash : codes de secours\nCompte : ${email}\nServeur : ${location.origin}\n\n${text}\n\nChaque code ne sert qu'une fois. Garde-les hors ligne.\n`], { type: "text/plain" }),
+      "excalibash-codes-de-secours.txt",
+    );
+  return (
+    <div style={{ padding: 20, display: "grid", gap: 12, maxWidth: 420 }}>
+      <p className="sub" style={{ margin: 0 }}>
+        Voici tes 10 codes de secours. Si tu perds ton application, chacun te laisse te connecter une fois. <b>Ils ne seront plus jamais affichés.</b>
+      </p>
+      <div className="codebox" data-testid="mfa-backup-codes" style={{ whiteSpace: "pre-line", fontSize: 14 }}>
+        {text}
+        <button type="button" className="btn btn-ghost btn-icon btn-sm" title="Copier" onClick={() => copyText(text)}>
+          <KeyRound size={15} />
+        </button>
+      </div>
+      <div style={{ display: "flex", gap: 10 }}>
+        <button className="btn" onClick={() => copyText(text)}>
+          Copier
+        </button>
+        <button className="btn" onClick={download}>
+          <Download size={16} /> Télécharger (.txt)
+        </button>
+      </div>
+      <label className="check">
+        <input type="checkbox" checked={saved} onChange={(e) => setSaved(e.target.checked)} />
+        <span>Je les ai rangés en lieu sûr</span>
+      </label>
+      <button className="btn btn-primary" disabled={!saved} onClick={onDone}>
+        Terminé
+      </button>
+    </div>
   );
 }
 

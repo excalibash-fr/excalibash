@@ -12,7 +12,8 @@ Usage : node excalibash-mcp.mjs [commande] [options]
 
 Commandes :
   login     Se connecte (adresse, email, mot de passe) et enregistre la session et la clé
-            (variables EXCALIBASH_URL, EXCALIBASH_EMAIL, EXCALIBASH_PASSWORD pour le mode non interactif)
+            (variables EXCALIBASH_URL, EXCALIBASH_EMAIL, EXCALIBASH_PASSWORD pour le mode non interactif ;
+            EXCALIBASH_TOTP pour le code à deux facteurs, si le compte en a un)
   logout    Ferme la session sur le serveur et supprime le fichier de configuration
   statut    Affiche l'état de la connexion
   serve     Lance le serveur MCP sur stdin/stdout (commande par défaut)
@@ -93,7 +94,7 @@ async function cmdLogin(configPath: string) {
   const password = process.env.EXCALIBASH_PASSWORD || (await ask("Mot de passe : ", true));
   if (!email || !password) throw new Error("Email et mot de passe obligatoires.");
   if (url.startsWith("http://") && !/^http:\/\/(localhost|127\.|\[::1\])/.test(url)) log("Attention : connexion en HTTP clair (hors machine locale).");
-  const cfg = await login(url, email, password);
+  const cfg = await login(url, email, password, async () => process.env.EXCALIBASH_TOTP || (await ask("Code à deux facteurs : ")));
   saveConfig(configPath, cfg);
   log(`Connecté en tant que ${cfg.email} sur ${cfg.url}.\nConfiguration enregistrée dans ${configPath} (clé privée incluse : protège ce fichier).`);
 }

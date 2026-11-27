@@ -132,13 +132,28 @@ export async function resendCode(email: string): Promise<void> {
   await api.post("/auth/resend", { email });
 }
 
-export async function login(email: string, password: string): Promise<Session> {
+/** Password accepted but the account has a second factor: the code finishes the login (or the recovery). */
+export type MfaStep = { mfaRequired: true; finish: (code: string) => Promise<Session> };
+
+export async function login(email: string, password: string): Promise<Session | MfaStep> {
   const { salt } = await api.post<{ salt: string }>("/auth/prelogin", { email });
   const { authKey, masterKey } = await deriveAccountKeys(password, salt);
-  const r = await api.post<{ user: User; keys: { publicKey: string; encPrivateKey: string } }>("/auth/login", { email, authKey });
-  const keys = await openPrivateKey(r.keys.encPrivateKey, masterKey, r.user.id, r.keys.publicKey);
-  await storeKeys(r.user.id, keys);
-  return { user: r.user, keys };
+  const r = await api.post<{ user?: User; keys?: { publicKey: string; encPrivateKey: string }; mfaRequired?: boolean; mfaToken?: string }>("/auth/login", { email, authKey });
+  const open = async (r: { user: User; keys: { publicKey: string; encPrivateKey: string } }): Promise<Session> => {
+    const keys = await openPrivateKey(r.keys.encPrivateKey, masterKey, r.user.id, r.keys.publicKey);
+    await storeKeys(r.user.id, keys);
+    return { user: r.user, keys };
+  };
+  if (r.mfaRequired) {
+    return { mfaRequired: true, finish: async (code) => open(await api.post("/auth/mfa", { mfaToken: r.mfaToken, code })) };
+  }
+  return open(r as { user: User; keys: { publicKey: string; encPrivateKey: string } });
+}
+
+/** The password as the server wants it proven (for the actions that ask for it again). */
+export async function authKeyFor(email: string, password: string): Promise<string> {
+  const { salt } = await api.post<{ salt: string }>("/auth/prelogin", { email });
+  return (await deriveAccountKeys(password, salt)).authKey;
 }
 
 /** A session cookie without keys on this device (cleared storage, new browser profile…). */
@@ -156,23 +171,28 @@ export async function unlock(user: User, password: string): Promise<KeyPair> {
   return keys;
 }
 
-export async function recover(email: string, recoveryKey: string, newPassword: string): Promise<Session> {
+export async function recover(email: string, recoveryKey: string, newPassword: string): Promise<Session | MfaStep> {
   const rec = await recoveryKeys(parseRecoveryKey(recoveryKey));
-  const r = await api.post<{ userId: string; publicKey: string; recoveryEncPrivateKey: string }>("/auth/recover", { email, recoveryAuth: rec.recoveryAuth });
+  const r = await api.post<{ userId: string; publicKey: string; recoveryEncPrivateKey: string; mfaRequired?: boolean }>("/auth/recover", { email, recoveryAuth: rec.recoveryAuth });
   const pkcs8 = await unbox(rec.recoveryEnc, r.recoveryEncPrivateKey, AAD.priv(r.userId));
   await openKeyPair(pkcs8, r.publicKey); // refuse before touching the account if the server lies
   const salt = toB64(randomBytes(16));
   const { authKey, masterKey } = await deriveAccountKeys(newPassword, salt);
-  const done = await api.post<{ user: User }>("/auth/recover/finish", {
-    email,
-    recoveryAuth: rec.recoveryAuth,
-    salt,
-    authKey,
-    encPrivateKey: await box(masterKey, pkcs8, AAD.priv(r.userId)),
-  });
-  const keys = await openKeyPair(pkcs8, r.publicKey);
-  await storeKeys(done.user.id, keys);
-  return { user: done.user, keys };
+  const finish = async (mfaCode?: string): Promise<Session> => {
+    const done = await api.post<{ user: User }>("/auth/recover/finish", {
+      email,
+      recoveryAuth: rec.recoveryAuth,
+      mfaCode,
+      salt,
+      authKey,
+      encPrivateKey: await box(masterKey, pkcs8, AAD.priv(r.userId)),
+    });
+    const keys = await openKeyPair(pkcs8, r.publicKey);
+    await storeKeys(done.user.id, keys);
+    return { user: done.user, keys };
+  };
+  // With a second factor the recovery key is not enough: the code is asked before the password is replaced.
+  return r.mfaRequired ? { mfaRequired: true, finish } : finish();
 }
 
 export async function changePassword(user: User, current: string, next: string): Promise<void> {

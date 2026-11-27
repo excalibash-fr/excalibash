@@ -1,4 +1,4 @@
-export type User = { id: string; email: string; name: string; isAdmin: boolean; color: string; publicKey: string };
+export type User = { id: string; email: string; name: string; isAdmin: boolean; color: string; publicKey: string; mfaEnabled: boolean };
 
 export type Role = "owner" | "editor" | "viewer";
 

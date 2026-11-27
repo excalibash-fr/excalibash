@@ -32,6 +32,7 @@ Polices d'Excalidraw servies par l'application (copiées depuis `@excalidraw/exc
 | Lucide | ISC | <https://github.com/lucide-icons/lucide> |
 | Monaco Editor (`monaco-editor`), y-monaco | MIT | <https://github.com/microsoft/monaco-editor>, <https://github.com/yjs/y-monaco> |
 | Yjs, y-protocols, lib0 | MIT | <https://github.com/yjs/yjs>, <https://github.com/yjs/y-protocols>, <https://github.com/dmonad/lib0> |
+| qrcode-generator (QR code de la double authentification, dessiné dans le navigateur) | MIT | <https://github.com/kazuhikoarase/qrcode-generator> |
 | marked (Markdown des notebooks, rendu dans un cadre isolé) | MIT | <https://github.com/markedjs/marked> |
 
 ## Serveur
