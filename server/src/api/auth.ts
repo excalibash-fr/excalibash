@@ -28,6 +28,8 @@ import { emailEnabled, sendVerificationCode, verificationRequired } from "../mai
 import { notify } from "../notify.ts";
 import { createChallenge, verifyPow } from "../pow.ts";
 import { assertNotLocked, failed, succeeded } from "../lockout.ts";
+import { backupRemaining, checkSecondFactor, dropMfaToken, dropMfaTokensOf, issueMfaToken, mfaTokenUser, strikeMfaToken } from "../mfa.ts";
+import { securityEvent } from "../securityLog.ts";
 import { kickUser } from "../rooms.ts";
 import { dropUserTunnelSessions } from "../tunnelSessions.ts";
 import { isEmail } from "../validate.ts";
@@ -250,6 +252,16 @@ authApi.post("/login", async (req, res) => {
   succeeded("login", keys);
   if (!flags(row.id).email_verified) coded(403, "Vérifie ton email pour te connecter.", "EMAIL_NOT_VERIFIED");
   checkSuspended(row.id);
+  // Password right, second factor on: no session and no keys until the code is given (POST /mfa).
+  if (row.totp_enabled) {
+    res.json({ mfaRequired: true, mfaToken: issueMfaToken(row.id) });
+    return;
+  }
+  finishLogin(req, res, row);
+});
+
+/** Opens the session and answers a login: the user and the encrypted private key. */
+function finishLogin(req: Request, res: Response, row: UserRow) {
   createSession(req, res, row.id);
   const when = new Date().toLocaleString("fr-FR", { dateStyle: "full", timeStyle: "short" });
   notify(req, [row.id], "newLogin", "Excalibash : nouvelle connexion à ton compte", () => ({
@@ -259,6 +271,39 @@ authApi.post("/login", async (req, res) => {
     note: "Si c'est toi, tu n'as rien à faire. Sinon, change ton mot de passe tout de suite : les autres appareils seront déconnectés.",
   }));
   res.json({ user: toUser(row), keys: { publicKey: row.public_key, encPrivateKey: row.enc_private_key } });
+}
+
+const BAD_CODE = "Code incorrect";
+
+/** Counts a wrong second-factor code (journal, delay, lock) and answers: always the same 401. */
+async function badCode(userId: string | undefined, ip: string): Promise<HttpError> {
+  await failed("mfa", { account: userId, ip });
+  return new HttpError(401, BAD_CODE);
+}
+
+/**
+ * Step 2 of a login with a second factor: the token from /login plus a TOTP or a backup code. A wrong code, an
+ * unknown or expired token all look the same; the token is destroyed at its 5th wrong code.
+ */
+authApi.post("/mfa", async (req, res) => {
+  limit(`mfa:${req.ip}`, 60);
+  const token = typeof req.body.mfaToken === "string" ? req.body.mfaToken.slice(0, 100) : "";
+  const userId = mfaTokenUser(token);
+  const keys = { account: userId, ip: req.ip! };
+  assertNotLocked("mfa", keys);
+  const row = userId ? getUserRow(userId) : undefined;
+  if (!row) throw await badCode(userId, req.ip!);
+  const used = checkSecondFactor(row, String(req.body.code ?? "").slice(0, 40));
+  if (!used) {
+    strikeMfaToken(token);
+    throw await badCode(row.id, req.ip!);
+  }
+  dropMfaToken(token);
+  succeeded("mfa", keys);
+  if (used === "backup") securityEvent("mfa_backup_used", { account: row.id, remaining: backupRemaining(row.id) });
+  if (!flags(row.id).email_verified) coded(403, "Vérifie ton email pour te connecter.", "EMAIL_NOT_VERIFIED");
+  checkSuspended(row.id);
+  finishLogin(req, res, row);
 });
 
 /** The account whose recovery key the request proves (401 otherwise); failures are counted like logins. */
@@ -282,13 +327,23 @@ async function checkRecoveryKey(req: Request): Promise<UserRow> {
 authApi.post("/recover", async (req, res) => {
   const row = await checkRecoveryKey(req);
   checkSuspended(row.id);
-  res.json({ userId: row.id, publicKey: row.public_key, recoveryEncPrivateKey: row.recovery_enc_private_key });
+  // With a second factor, step 2 needs a code too: the client asks for it before going on.
+  res.json({ userId: row.id, publicKey: row.public_key, recoveryEncPrivateKey: row.recovery_enc_private_key, mfaRequired: !!row.totp_enabled });
 });
 
 /** Step 2: set a new password (re-encrypted private key), logging out every other session. */
 authApi.post("/recover/finish", async (req, res) => {
   const row = await checkRecoveryKey(req);
   checkSuspended(row.id);
+  // The recovery key alone must not get around the second factor.
+  if (row.totp_enabled) {
+    const keys = { account: row.id, ip: req.ip! };
+    assertNotLocked("mfa", keys);
+    const used = checkSecondFactor(row, String(req.body.mfaCode ?? "").slice(0, 40));
+    if (!used) throw await badCode(row.id, req.ip!);
+    succeeded("mfa", keys);
+    if (used === "backup") securityEvent("mfa_backup_used", { account: row.id, remaining: backupRemaining(row.id) });
+  }
   db.prepare("UPDATE users SET auth_hash = ?, kdf_salt = ?, enc_private_key = ? WHERE id = ?").run(
     await hashSecretAsync(blob(req.body.authKey, 100)),
     blob(req.body.salt, 64),
@@ -297,6 +352,7 @@ authApi.post("/recover/finish", async (req, res) => {
   );
   db.prepare("DELETE FROM sessions WHERE user_id = ?").run(row.id);
   dropUserTunnelSessions(row.id);
+  dropMfaTokensOf(row.id);
   // Live boards opened with the old sessions are cut too (the client reconnects if it still can).
   kickUser(row.id, 4001, "session terminée");
   createSession(req, res, row.id);
@@ -353,6 +409,7 @@ authApi.post("/password", async (req, res) => {
   // Every other device must log in again with the new password.
   db.prepare("DELETE FROM sessions WHERE user_id = ? AND token_hash != ?").run(row.id, currentSessionHash(req) ?? "");
   dropUserTunnelSessions(row.id, currentSessionHash(req) ?? "");
+  dropMfaTokensOf(row.id);
   kickUser(row.id, 4001, "session terminée");
   res.json({ ok: true });
 });

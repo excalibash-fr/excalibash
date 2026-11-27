@@ -13,6 +13,8 @@ import { HttpError, pid, publicUrl, str } from "../http.ts";
 import { newInviteToken } from "./auth.ts";
 import { sendTestMail, smtpStatus } from "../mailer.ts";
 import { isEmail } from "../validate.ts";
+import { clearMfa, dropMfaTokensOf, mfaRequiredForAdmins } from "../mfa.ts";
+import { securityEvent } from "../securityLog.ts";
 
 /**
  * Administration is deliberately narrow: admins manage *accounts*, never content.
@@ -20,6 +22,14 @@ import { isEmail } from "../validate.ts";
  */
 export const adminApi = Router();
 adminApi.use(requireUser, requireAdmin);
+// With "MFA required for admins", an admin without a second factor keeps their session but not the administration.
+adminApi.use((req, res, next) => {
+  if (mfaRequiredForAdmins() && !req.user!.mfaEnabled) {
+    res.status(403).json({ error: "L'administration exige la double authentification : active-la depuis ton compte.", code: "MFA_REQUIRED" });
+    return;
+  }
+  next();
+});
 
 const num = (sql: string, ...args: any[]): number => (db.prepare(sql).get(...args) as { n: number | null }).n ?? 0;
 
@@ -38,7 +48,7 @@ adminApi.get("/", async (_req, res) => {
   const rows = db
     .prepare(
       `SELECT u.id, u.email, u.name, u.is_admin AS isAdmin, u.color, u.created_at AS createdAt,
-        u.email_verified AS emailVerified, u.suspended, u.last_seen_at AS lastSeenAt,
+        u.email_verified AS emailVerified, u.suspended, u.totp_enabled AS mfaEnabled, u.last_seen_at AS lastSeenAt,
         (SELECT COUNT(*) FROM items i WHERE i.owner_id = u.id AND i.kind = 'board') AS boards,
         (SELECT COUNT(*) FROM items i WHERE i.owner_id = u.id AND i.kind = 'folder') AS folders,
         (SELECT COUNT(*) FROM machines m WHERE m.owner_id = u.id) AS machines,
@@ -73,6 +83,7 @@ adminApi.get("/", async (_req, res) => {
       createdAt: r.createdAt,
       emailVerified: !!r.emailVerified,
       suspended: !!r.suspended,
+      mfaEnabled: !!r.mfaEnabled,
       lastSeenAt: r.lastSeenAt as number | null,
       boards: r.boards,
       folders: r.folders,
@@ -108,12 +119,20 @@ adminApi.get("/", async (_req, res) => {
     stats,
     registrationOpen: getSetting("registration_open", "false") === "true",
     emailVerification: getSetting("email_verification", "true") === "true",
+    mfaRequiredAdmins: mfaRequiredForAdmins(),
   });
 });
 
 adminApi.patch("/settings", (req, res) => {
   if (typeof req.body.registrationOpen === "boolean") setSetting("registration_open", String(req.body.registrationOpen));
   if (typeof req.body.emailVerification === "boolean") setSetting("email_verification", String(req.body.emailVerification));
+  if (typeof req.body.mfaRequiredAdmins === "boolean") {
+    // The admin who turns it on must have the second factor themselves, or they would lock themselves out.
+    if (req.body.mfaRequiredAdmins && !req.user!.mfaEnabled) {
+      throw new HttpError(400, "Active d'abord la double authentification sur ton propre compte (page Compte), sinon tu perdrais l'accès à l'administration");
+    }
+    setSetting("mfa_required_admins", String(req.body.mfaRequiredAdmins));
+  }
   res.json({ ok: true });
 });
 
@@ -173,6 +192,19 @@ adminApi.patch("/users/:id", (req, res) => {
       disconnectUserMachines(id);
     }
   }
+  res.json({ ok: true });
+});
+
+/** Lost phone and backup codes: turns the second factor off for someone else (never for oneself). */
+adminApi.post("/users/:id/mfa-reset", (req, res) => {
+  const id = pid(req);
+  if (id === req.user!.id) throw new HttpError(400, "Impossible de réinitialiser sa propre double authentification");
+  const row = getUserRow(id);
+  if (!row) throw new HttpError(404, "Compte introuvable");
+  if (!row.totp_enabled) throw new HttpError(400, "Ce compte n'a pas la double authentification");
+  clearMfa(id);
+  dropMfaTokensOf(id);
+  securityEvent("mfa_reset", { by: req.user!.id, account: id });
   res.json({ ok: true });
 });
 
