@@ -295,3 +295,11 @@ export function cursorStyleSheet(peers: { clientId: number; name: unknown; color
     })
     .join("\n");
 }
+
+/** What the user picked in the diff shown on a save conflict. */
+export type DiffChoice = "overwrite" | "take" | "cancel";
+
+/** What a choice does: write the document anyway, and/or replace the document by the machine version. */
+export function diffOutcome(choice: DiffChoice): { save: boolean; adopt: boolean } {
+  return { save: choice === "overwrite", adopt: choice === "take" };
+}
