@@ -35,7 +35,7 @@ Tout le TP tient sur un seul tableau, partagé avec le binôme ou le prof. Les d
 - **Vérifier le schéma.** Le bouton « Vérifier le schéma » de l'en-tête interroge les agents des machines raccordées par un câble et compare leurs interfaces réelles à ce qui est dessiné : interface absente (avec suggestion du vrai nom), interface down, IP absente ou présente ailleurs, préfixe différent, adresses de VLAN sans sous-interface. Les extrémités en écart reçoivent un badge, un panneau liste les écarts (et les adresses de la machine absentes du schéma) avec « Corriger le schéma » en un clic, annulable. Les équipements Telnet / SSH sont ignorés : il faut l'agent. Les noms et adresses restent chiffrés de bout en bout, le serveur ne voit rien. Test : `node --experimental-strip-types web/src/board/schemaCheck.test.ts`.
 - **Export du schéma.** Le bouton d'export du tableau produit une image PNG ou SVG, ou la topologie dessinée par les câbles : fichier Containerlab (`.clab.yml`, kind et image à adapter, IP et VLAN en commentaire, adresses avec masque posées par `exec`), graphe Mermaid (`.mmd`) ou JSON. Tout est généré dans le navigateur ; les interfaces manquantes sont numérotées `eth1`, `eth2`… avec un avertissement. Test : `node --experimental-strip-types web/src/board/topology.test.ts`.
 - **Générer la config.** Sélectionne une icône (bouton « Générer la config » de sa barre) ou une forme ou un groupe câblé (bouton « Config ») : l'application écrit la configuration de ses interfaces d'après les extrémités de câble (interface, IP avec masque, VLAN, IP par VLAN) : Cisco IOS en mode switch (`vlan`, access / trunk, interfaces VLAN) ou routeur (sous-interfaces `dot1Q`), commandes Linux `ip` ou fichier netplan. Aperçu en direct, copie, téléchargement, ou envoi ligne par ligne (une toutes les 40 ms, avec confirmation et bouton d'annulation) dans un terminal ouvert de l'icône : shell local ou session Telnet / SSH. Tout est généré dans le navigateur et seuls des noms d'interface, adresses et VLAN bien formés sont écrits (un libellé de câble ne peut pas ajouter de commande). Test : `node --experimental-strip-types web/src/board/configGen.test.ts`.
-- **Code à plusieurs.** Une fenêtre « Code » sur l'icône d'une machine ouvre Monaco, le cœur libre de VS Code, lié à un document partagé : édition simultanée chiffrée de bout en bout (le serveur ne relaie que des chiffrés), curseurs et sélections colorés au nom de chacun, lecture seule pour les lecteurs. Un fichier de la machine s'ouvre depuis son shell local et s'enregistre avec <kbd>Ctrl</kbd>+<kbd>S</kbd> (confirmation si le fichier a changé entre-temps) ; « Exécuter dans le terminal » lance un script `.py`, `.sh` ou `.js` après confirmation de la ligne de commande. Le code chargé est le même pour tous et Monaco n'est téléchargé que si le tableau contient une fenêtre de code. Test : `node --experimental-strip-types web/src/board/code.test.ts`.
+- **Code à plusieurs.** Une fenêtre « Code » sur l'icône d'une machine ouvre Monaco, le cœur libre de VS Code, lié à un document partagé : édition simultanée chiffrée de bout en bout (le serveur ne relaie que des chiffrés), curseurs et sélections colorés au nom de chacun, lecture seule pour les lecteurs. Un fichier de la machine s'ouvre depuis son shell local et s'enregistre avec <kbd>Ctrl</kbd>+<kbd>S</kbd> (confirmation si le fichier a changé entre-temps) ; un explorateur de fichiers (bouton dans l'en-tête) parcourt les dossiers de la machine à la demande et ouvre un fichier dans sa propre fenêtre ; « Exécuter dans le terminal » lance un script `.py`, `.sh` ou `.js` après confirmation de la ligne de commande. Le code chargé est le même pour tous et Monaco n'est téléchargé que si le tableau contient une fenêtre de code. Test : `node --experimental-strip-types web/src/board/code.test.ts`.
 - **Notebooks à plusieurs.** Une fenêtre « Notebook » ouvre un notebook Jupyter (`.ipynb`) dont les cellules sont éditées en même temps par plusieurs personnes (Monaco, curseurs colorés, document chiffré de bout en bout). Le code s'exécute sur un **noyau Python partagé** lancé sur la machine par son agent (il faut `pip install ipykernel jupyter_client` sur la machine) : seuls ceux qui ont accès à la machine peuvent le démarrer, tous les éditeurs du tableau peuvent ensuite exécuter des cellules, et les sorties (texte, erreurs, images, HTML) sont visibles par tous. Les sorties riches s'affichent dans des cadres isolés, sans script. Un `.ipynb` de la machine s'ouvre et s'enregistre depuis son shell local (<kbd>Ctrl</kbd>+<kbd>S</kbd>, confirmation si le fichier a changé). Test : `node --experimental-strip-types web/src/board/notebook.test.ts`.
 - **Collaboration en temps réel.** Dessin, curseurs, sélections et terminaux partagés.
 - **Dossiers partagés.** Partage en lecture ou en édition ; les sous-dossiers suivent. Retirer quelqu'un renouvelle toutes les clés du sous-arbre.
@@ -78,6 +78,10 @@ Les variables se placent dans un fichier `.env` à côté de `docker-compose.yml
 |---|---|---|
 | `PUBLIC_URL` | URL de la requête | URL publique, utilisée dans les commandes d'installation de l'agent |
 | `PROXY_URL` | même hôte, port 6768 | URL publique de l'origine séparée des tunnels web |
+| `TUNNEL_DOMAIN` | vide | active le mode sous-domaine : chaque tunnel web est servi sur `https://<id>.<TUNNEL_DOMAIN>/` (voir « Un sous-domaine par tunnel »). Vide : un seul port, `/t/<id>/` |
+| `TUNNEL_PROXY_SECRET` | vide | secret partagé avec le reverse proxy des tunnels (`X-Tunnel-Auth`), 32 caractères au moins. Obligatoire avec `TUNNEL_DOMAIN`, ainsi que `PUBLIC_URL` |
+| `TUNNEL_SCHEME` | `https` | `http` seulement pour des essais locaux |
+| `TUNNEL_SESSION_HOURS` | `8` | durée de la session d'un tunnel dans un navigateur |
 | `TLS` | `auto` | `auto` : HTTPS sur les deux ports, avec le certificat fourni ou un certificat auto-signé. `off` : HTTP seul, derrière un reverse proxy qui fait le TLS |
 | `TLS_CERT` `TLS_KEY` | vide | chemins PEM d'un certificat fourni (Let's Encrypt, PKI interne), utilisé à la place du certificat auto-signé |
 | `TLS_SANS` | vide | noms ou adresses IP supplémentaires du certificat auto-signé, séparés par des virgules |
@@ -133,6 +137,44 @@ PROXY_URL=https://tunnel.example.com
 TLS=off
 COOKIE_SECURE=true
 ```
+
+### Un sous-domaine par tunnel
+
+Optionnel : avec `TUNNEL_DOMAIN`, chaque tunnel a sa propre origine (`https://<id>.tunnel.example.com/`) : les sites voient leurs vrais chemins, ne partagent ni stockage ni cookies, et connaître une adresse ne suffit plus à joindre le relais. Sans `TUNNEL_DOMAIN`, rien ne change (tunnels en `/t/<id>/`), ce qui convient aux instances sans DNS wildcard.
+
+Il faut un enregistrement DNS `*.tunnel.example.com`, un certificat wildcard, et un reverse proxy qui envoie les sous-domaines au port 6768 en y ajoutant les deux en-têtes ci-dessous (en écrasant ceux du client). `TUNNEL_DOMAIN` doit être sous le même domaine que `PUBLIC_URL`, et le port 6768 ne doit être joignable que par ce proxy.
+
+```dotenv
+PUBLIC_URL=https://excalibash.example.com
+TUNNEL_DOMAIN=tunnel.example.com
+TUNNEL_PROXY_SECRET=une-longue-valeur-aleatoire-d-au-moins-32-caracteres
+TLS=off
+COOKIE_SECURE=true
+```
+
+```nginx
+map $http_upgrade $connection_upgrade { default upgrade; "" close; }
+
+server {
+  listen 443 ssl;
+  server_name *.tunnel.example.com;
+  # ssl_certificate / ssl_certificate_key : certificat wildcard
+  client_max_body_size 64m;
+  location / {
+    proxy_pass http://127.0.0.1:6768;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Tunnel-Host $host;
+    proxy_set_header X-Tunnel-Auth "<TUNNEL_PROXY_SECRET>";
+    proxy_set_header X-Forwarded-For $remote_addr;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection $connection_upgrade;
+  }
+}
+```
+
+`proxy_set_header` remplace les en-têtes du même nom envoyés par le client. Avec BunkerWeb, ajouter les mêmes en-têtes au reverse proxy du service `*.tunnel.example.com`. Les tunnels créés avant ce mode (identifiants plus anciens) ne s'ouvrent pas en sous-domaine : les fermer et les recréer. Détails de sécurité : [docs/SECURITY.md](docs/SECURITY.md).
 
 Par défaut, `docker-compose.yml` ne publie les ports 6767 et 6768 que sur `127.0.0.1` : seul le reverse proxy, en 80 et 443, est exposé. Le volume `excalibash-data` contient toutes les données ; son contenu est chiffré.
 

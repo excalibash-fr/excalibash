@@ -14,6 +14,25 @@ function numEnv(name: string, fallback: number): number {
 const tlsMode = process.env.TLS || "auto";
 if (tlsMode !== "auto" && tlsMode !== "off") throw new Error(`TLS=${tlsMode} : valeurs possibles auto ou off`);
 
+/**
+ * Subdomain mode for web tunnels: every tunnel gets its own origin https://<id>.<TUNNEL_DOMAIN>/,
+ * reached through a reverse proxy that adds X-Tunnel-Host and X-Tunnel-Auth. Off without TUNNEL_DOMAIN.
+ */
+function tunnelConfig() {
+  const domain = (process.env.TUNNEL_DOMAIN ?? "").trim().toLowerCase();
+  const secret = process.env.TUNNEL_PROXY_SECRET ?? "";
+  const scheme = process.env.TUNNEL_SCHEME || "https";
+  if (scheme !== "https" && scheme !== "http") throw new Error(`TUNNEL_SCHEME=${scheme} : valeurs possibles https ou http`);
+  const hours = numEnv("TUNNEL_SESSION_HOURS", 8);
+  if (!domain) return { domain: "", secret: "", scheme, sessionHours: hours } as const;
+  const label = "[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?";
+  if (domain.length > 200 || !new RegExp(`^${label}(?:\\.${label})*$`).test(domain)) throw new Error(`TUNNEL_DOMAIN=${domain} : nom DNS en minuscules attendu (ex. tunnel.example.com)`);
+  if (secret.length < 32) throw new Error("TUNNEL_PROXY_SECRET : 32 caractères au moins sont obligatoires quand TUNNEL_DOMAIN est défini");
+  if (hours <= 0) throw new Error("TUNNEL_SESSION_HOURS : un nombre d'heures strictement positif est attendu");
+  if (!process.env.PUBLIC_URL) throw new Error("PUBLIC_URL : obligatoire quand TUNNEL_DOMAIN est défini (l'origine d'Excalibash ne peut pas se déduire des requêtes des tunnels)");
+  return { domain, secret, scheme, sessionHours: hours } as const;
+}
+
 export const config = {
   port: Number(process.env.PORT ?? 6767),
   host: process.env.HOST ?? "0.0.0.0",
@@ -78,6 +97,7 @@ export const config = {
   /** Code required to create the first (admin) account. Random and printed at startup when unset. */
   setupCode: process.env.SETUP_CODE ?? "",
   proxyPort: Number(process.env.PROXY_PORT ?? 6768),
+  tunnel: tunnelConfig(),
   proxyUrl: process.env.PROXY_URL ?? "",
   /** Encrypted scrollback kept per terminal, replayed to new viewers. */
   scrollbackBytes: Number(process.env.SCROLLBACK_BYTES ?? 768 * 1024),

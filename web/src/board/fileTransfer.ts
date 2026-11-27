@@ -1,7 +1,8 @@
 // Browser side of file transfers and packet captures (agent/files.go). Everything rides on a
 // local-shell terminal and is sealed with its key; the server only relays opaque frames. Names,
 // paths, contents, interfaces and filters never leave a box.
-import { fromB64, randomId, toB64 } from "../crypto.ts";
+import { fromB64, randomId, sha256Hex, toB64 } from "../crypto.ts";
+import { FILTER_TOKEN_RE } from "../validators.ts";
 import type { BoardSession } from "./collab.ts";
 import { OutdatedError, supports, type Feature } from "../agentCaps.ts";
 import { reportOutdated } from "../outdatedBus.ts";
@@ -16,10 +17,6 @@ const REPLY_TIMEOUT = 70_000;
 export const FIRST_REPLY_TIMEOUT = 10_000;
 const NO_ANSWER = "La machine ne répond pas : agent hors ligne ou trop ancien";
 
-/** Interface and filter rules of the agent, for early feedback (the agent checks again). */
-export const IFACE_RE = /^[A-Za-z0-9][A-Za-z0-9._:@-]{0,31}$/;
-const FILTER_TOKEN_RE = /^[A-Za-z0-9._:/!()&|<>=-]{1,64}$/;
-
 /** Why a BPF filter is refused, or null. */
 export function filterProblem(filter: string): string | null {
   const tokens = filter.split(/\s+/).filter(Boolean);
@@ -33,11 +30,11 @@ export function validName(name: string): boolean {
 }
 
 export class FileError extends Error {
-  constructor(
-    message: string,
-    readonly code?: string,
-  ) {
+  readonly code?: string;
+
+  constructor(message: string, code?: string) {
     super(message);
+    this.code = code;
   }
 }
 
@@ -45,18 +42,19 @@ export type Entry = { name: string; dir: boolean; size: number; mtime: number };
 export type Listing = { cwd: string; entries: Entry[]; truncated: boolean };
 export type MachineIface = { name: string; up: boolean; addrs: string[] };
 
-const hex = (b: ArrayBuffer) => [...new Uint8Array(b)].map((x) => x.toString(16).padStart(2, "0")).join("");
-const sha256 = async (data: BufferSource) => hex(await crypto.subtle.digest("SHA-256", data));
 
 /** `aborted` cancels a transfer; `stop` ends a capture early and keeps what was captured. */
 export type Signal = { aborted: boolean; stop?: boolean };
 
 /** The file operations of one local shell. */
 export class FileClient {
-  constructor(
-    private session: BoardSession,
-    private term: string,
-  ) {}
+  private session: BoardSession;
+  private term: string;
+
+  constructor(session: BoardSession, term: string) {
+    this.session = session;
+    this.term = term;
+  }
 
   /** The terminal this client talks through (a stable identity: the client itself is cheap and rebuilt often). */
   get terminal(): string {
@@ -155,7 +153,7 @@ export class FileClient {
       await Promise.all(inflight);
       if (failure) throw failure;
       if (o.signal?.aborted) throw new FileError("Transfert annulé");
-      const b = await this.call({ op: "end", xfer, sha256: await sha256(await file.arrayBuffer()) });
+      const b = await this.call({ op: "end", xfer, sha256: await sha256Hex(await file.arrayBuffer()) });
       return String(b.path);
     } catch (e) {
       cancel();
@@ -233,7 +231,7 @@ export class FileClient {
               // "end" is on the clear envelope: only the sealed last frame (with size and hash) proves the end.
               if (body.end !== true || typeof body.size !== "number" || typeof body.sha256 !== "string") return finish(() => reject(new FileError("Transfert incomplet")));
               if (body.size !== bytes) return finish(() => reject(new FileError("Transfert incomplet")));
-              if (body.sha256 !== (await sha256(buf))) return finish(() => reject(new FileError("Empreinte SHA-256 incorrecte : fichier corrompu")));
+              if (body.sha256 !== (await sha256Hex(buf))) return finish(() => reject(new FileError("Empreinte SHA-256 incorrecte : fichier corrompu")));
               finish(() => resolve({ name, blob }));
             });
           },

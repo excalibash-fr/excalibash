@@ -1,15 +1,12 @@
 import { useCallback, useEffect, useState } from "react";
-import { AlertTriangle, Copy, Fingerprint, Gift, Loader2, ShieldCheck, UserMinus, UserPlus } from "lucide-react";
+import { Copy, Gift, Loader2, UserMinus, UserPlus } from "lucide-react";
 import { api, type Role } from "../api.ts";
-import { fingerprint, fromB64 } from "../crypto.ts";
-import { checkContact, pathOf, revokeAccess, shareItem, useLibrary, useLibraryCtx, type Member, type Node } from "../library.tsx";
+import { pathOf, revokeAccess, shareItem, useLibrary, useLibraryCtx, type Member, type Node } from "../library.tsx";
+import { CandidateVerify, ContactSearch, useContactSearch, withFingerprints, type Candidate } from "./ContactPicker.tsx";
 import { PublicLinks } from "./PublicLinks.tsx";
 import { Avatar, Modal, confirmDialog, copyText, toast } from "./ui.tsx";
 
 const ROLE_LABEL: Record<Role, string> = { owner: "Propriétaire", editor: "Peut modifier", viewer: "Lecture seule" };
-
-type Found = { id: string; name: string; email?: string; publicKey: string; color: string };
-type Candidate = { id: string; name: string; email?: string; publicKey: string; fingerprint: string; check: "new" | "match" | "changed" };
 
 /** Sharing, and giving (transfer of ownership) when `giving` is set or from a member's row. */
 export function ShareModal({ node, onClose, giving = false }: { node: Node; onClose: () => void; giving?: boolean }) {
@@ -19,11 +16,9 @@ export function ShareModal({ node, onClose, giving = false }: { node: Node; onCl
   // Only an item at the top of the owner's files can change hands (its key is sealed to each member).
   const canGive = owner && !node.parentId && !node.deletedAt;
   const [members, setMembers] = useState<(Member & { fingerprint: string })[] | null>(null);
-  const [query, setQuery] = useState("");
-  const [results, setResults] = useState<Found[] | null>(null);
+  const search = useContactSearch();
+  const { candidate, override } = search;
   const [role, setRole] = useState<Role>("editor");
-  const [candidate, setCandidate] = useState<Candidate | null>(null);
-  const [override, setOverride] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
 
   /** People with access through a parent folder (managed from that folder), nearest folder first. */
@@ -31,7 +26,7 @@ export function ShareModal({ node, onClose, giving = false }: { node: Node; onCl
 
   const load = useCallback(async () => {
     const r = await api.get<{ grants: Member[] }>(`/items/${node.id}/grants`);
-    setMembers(await Promise.all(r.grants.map(async (g) => ({ ...g, fingerprint: await fingerprint(fromB64(g.publicKey)) }))));
+    setMembers(await withFingerprints(r.grants));
     const seen = new Set(r.grants.map((g) => g.userId));
     const out: (Member & { via: string })[] = [];
     for (const parent of pathOf(ctx.nodes, node.id).slice(0, -1).reverse()) {
@@ -45,41 +40,13 @@ export function ShareModal({ node, onClose, giving = false }: { node: Node; onCl
     load().catch(toast.error);
   }, [load]);
 
-  const lookup = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setCandidate(null);
-    setResults(null);
-    setOverride(false);
-    try {
-      const { users } = await api.get<{ users: Found[] }>(`/auth/lookup?q=${encodeURIComponent(query.trim())}`);
-      setResults(users.filter((u) => u.id !== ctx.user.id));
-      if (users.length && users.every((u) => u.id === ctx.user.id)) throw new Error("C'est toi !");
-    } catch (err) {
-      toast.error(err);
-    }
-  };
-
-  const pick = async (user: Found) => {
-    try {
-      setCandidate({
-        ...user,
-        fingerprint: await fingerprint(fromB64(user.publicKey)),
-        check: await checkContact(ctx.user, ctx.keys, user.id, user.email, user.publicKey),
-      });
-      setResults(null);
-    } catch (err) {
-      toast.error(err);
-    }
-  };
-
   const share = async () => {
     if (!candidate) return;
     setBusy("share");
     try {
-      await shareItem(ctx, node.id, { ...candidate, email: candidate.email ?? "" }, role, candidate.check === "changed" && override);
+      await shareItem(ctx, node.id, { ...candidate, email: candidate.email ?? "" }, role, search.accepted);
       toast(`Partagé avec ${candidate.name}`);
-      setCandidate(null);
-      setQuery("");
+      search.reset();
       await Promise.all([load(), refresh()]);
     } catch (e) {
       toast.error(e);
@@ -135,7 +102,10 @@ export function ShareModal({ node, onClose, giving = false }: { node: Node; onCl
     if (!ok) return;
     setBusy(m.userId);
     try {
-      await revokeAccess(ctx, node.id, m.userId, (msg) => setBusy(`${m.userId}:${msg}`));
+      const r = await revokeAccess(ctx, node.id, m.userId, (msg) => setBusy(`${m.userId}:${msg}`));
+      // Parts of a shared document that could not be read (corrupted, or planted to block this
+      // revocation) were left out of the re-encrypted copy instead of stopping the revocation.
+      if (r?.skippedDocParts) toast.error(`${r.skippedDocParts} partie(s) illisible(s) d'un document partagé ont été écartées pendant le renouvellement des clés.`);
       toast(`${m.name} n'a plus accès — clés renouvelées`);
       await Promise.all([load(), refresh()]);
     } catch (e) {
@@ -166,100 +136,41 @@ export function ShareModal({ node, onClose, giving = false }: { node: Node; onCl
       )}
 
       {owner && (
-        <form onSubmit={lookup} style={{ display: "flex", gap: 8, marginBottom: 12 }}>
-          <input
-            className="input"
-            required
-            minLength={2}
-            placeholder="Nom ou email"
-            aria-label="Nom ou email"
-            value={query}
-            onChange={(e) => {
-              setQuery(e.target.value);
-              setResults(null);
-            }}
-          />
-          {!giving && (
-            <select className="select" value={role} onChange={(e) => setRole(e.target.value as Role)}>
-              <option value="editor">Peut modifier</option>
-              <option value="viewer">Lecture seule</option>
-            </select>
-          )}
-          <button className="btn">Chercher</button>
-        </form>
-      )}
-
-      {owner && results && !candidate && (
-        <div className="panel" style={{ marginBottom: 12 }}>
-          {results.length === 0 ? (
-            <div className="row sub">
-              Aucun compte trouvé. La personne n'est peut-être pas trouvable par son nom : demande-lui son email (ou qu'elle active « Trouvable par mon email »).
-            </div>
-          ) : (
-            results.map((u) => (
-              <button type="button" className="row" key={u.id} style={{ width: "100%", textAlign: "left" }} onClick={() => pick(u)}>
-                <Avatar name={u.name} color={u.color} />
-                <div className="grow">
-                  <div className="title">{u.name}</div>
-                  {u.email && <div className="sub">{u.email}</div>}
-                </div>
-              </button>
-            ))
-          )}
-        </div>
+        <ContactSearch
+          search={search}
+          extra={
+            !giving && (
+              <select className="select" value={role} onChange={(e) => setRole(e.target.value as Role)}>
+                <option value="editor">Peut modifier</option>
+                <option value="viewer">Lecture seule</option>
+              </select>
+            )
+          }
+        />
       )}
 
       {candidate && (
-        <div className={`verify ${candidate.check === "changed" ? "danger" : ""}`}>
-          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-            <Avatar name={candidate.name} color="var(--brand)" />
-            <div style={{ flex: 1 }}>
-              <b>{candidate.name}</b>
-              {candidate.email && <div className="sub">{candidate.email}</div>}
-            </div>
-          </div>
-          <div className="fp">
-            <Fingerprint size={14} /> {candidate.fingerprint}
-          </div>
-          {candidate.check === "changed" ? (
-            <p className="warn">
-              <AlertTriangle size={14} /> La clé de cette personne a <b>changé</b> depuis ton dernier partage. Ça peut être une réinitialisation de son compte… ou
-              une tentative d'interception. Vérifie l'empreinte avec elle (en vrai, par téléphone…) avant de continuer.
-            </p>
-          ) : candidate.check === "match" ? (
-            <p className="ok">
-              <ShieldCheck size={14} /> Même clé que lors de vos précédents partages.
-            </p>
-          ) : (
-            <p className="sub" style={{ margin: "6px 0 0" }}>
-              Premier partage avec cette personne : pour une sécurité maximale, comparez cette empreinte avec celle affichée dans son onglet « Mon compte ».
-            </p>
-          )}
-          {candidate.check === "changed" && (
-            <label style={{ display: "flex", gap: 8, alignItems: "center", fontSize: 13, fontWeight: 600, marginTop: 8 }}>
-              <input type="checkbox" checked={override} onChange={(e) => setOverride(e.target.checked)} /> J'ai vérifié l'empreinte avec cette personne
-            </label>
-          )}
-          <div className="modal-actions" style={{ marginTop: 12 }}>
-            <button className="btn" onClick={() => setCandidate(null)}>
-              Annuler
-            </button>
-            {canGive && (
-              <button
-                className={`btn ${giving ? "btn-primary" : ""}`}
-                disabled={!!busy || (candidate.check === "changed" && !override)}
-                onClick={() => give({ userId: candidate.id, name: candidate.name }, candidate)}
-              >
-                <Gift size={16} /> Donner
-              </button>
-            )}
-            {!giving && (
-              <button className="btn btn-primary" disabled={busy === "share" || (candidate.check === "changed" && !override)} onClick={share}>
-                {busy === "share" ? <Loader2 size={16} className="spin" /> : <UserPlus size={16} />} Partager ({ROLE_LABEL[role].toLowerCase()})
-              </button>
-            )}
-          </div>
-        </div>
+        <CandidateVerify
+          search={search}
+          actions={
+            <>
+              {canGive && (
+                <button
+                  className={`btn ${giving ? "btn-primary" : ""}`}
+                  disabled={!!busy || search.blocked}
+                  onClick={() => give({ userId: candidate.id, name: candidate.name }, candidate)}
+                >
+                  <Gift size={16} /> Donner
+                </button>
+              )}
+              {!giving && (
+                <button className="btn btn-primary" disabled={busy === "share" || search.blocked} onClick={share}>
+                  {busy === "share" ? <Loader2 size={16} className="spin" /> : <UserPlus size={16} />} Partager ({ROLE_LABEL[role].toLowerCase()})
+                </button>
+              )}
+            </>
+          }
+        />
       )}
 
       {members?.length !== 0 && (

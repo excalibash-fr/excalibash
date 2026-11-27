@@ -9,6 +9,7 @@ import type { ExcalidrawElement } from "@excalidraw/excalidraw/element/types";
 import { cableEnds, cableOf } from "./cables.ts";
 import { labelRect } from "./CableOverlay.tsx";
 import { isWindow, nodeDataOf } from "./nodes.ts";
+import { saveBlob } from "../download.ts";
 
 type El = ExcalidrawElement;
 const INK = "#1e293b";
@@ -137,17 +138,6 @@ export function diagramShapes(elements: readonly El[], nameOf: (nodeId: string) 
   return restoreElements([...out, ...labels], null, { refreshDimensions: false, repairBindings: true }) as El[];
 }
 
-function save(blob: Blob, filename: string) {
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = filename;
-  document.body.append(a);
-  a.click();
-  a.remove();
-  setTimeout(() => URL.revokeObjectURL(url), 10_000);
-}
-
 const fileName = (name: string, ext: string) => `${name.replace(/[\\/:*?"<>|]+/g, "_").trim() || "schema"}.${ext}`;
 
 /** Downloads the diagram as a PNG (2×) or an SVG, on a white background. */
@@ -158,10 +148,10 @@ export async function exportDiagram(x: ExcalidrawImperativeAPI, kind: "png" | "s
   const files = x.getFiles();
   if (kind === "svg") {
     const svg = await exportToSvg({ elements, appState, files, exportPadding: PAD });
-    save(new Blob([new XMLSerializer().serializeToString(svg)], { type: "image/svg+xml" }), fileName(boardName, "svg"));
+    saveBlob(new Blob([new XMLSerializer().serializeToString(svg)], { type: "image/svg+xml" }), fileName(boardName, "svg"));
   } else {
     const blob = await exportToBlob({ elements, appState, files, exportPadding: PAD, mimeType: "image/png" });
-    save(blob, fileName(boardName, "png"));
+    saveBlob(blob, fileName(boardName, "png"));
   }
 }
 
@@ -178,6 +168,6 @@ export function exportTopology(x: ExcalidrawImperativeAPI, format: TopologyForma
   if (!topo.nodes.length) throw new Error("Le tableau est vide");
   const text = format === "containerlab" ? toContainerlab(topo, boardName) : format === "mermaid" ? toMermaid(topo) : toJSON(topo);
   const f = TOPOLOGY_FILES[format];
-  save(new Blob([text], { type: `${f.type};charset=utf-8` }), fileName(boardName, f.ext));
+  saveBlob(new Blob([text], { type: `${f.type};charset=utf-8` }), fileName(boardName, f.ext));
   return topo.warnings;
 }

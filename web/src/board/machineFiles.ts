@@ -92,5 +92,7 @@ export async function saveMachineFile(client: FileClient, path: string, text: st
 
 /** Types a command line into a shell (as if pasted and validated). */
 export function sendCommand(session: ShellHost, terminalId: string, line: string) {
-  session.terminalInput(terminalId, `${line.replace(/[\r\n]+/g, " ")}\r`);
+  // No control characters at all: the terminal acts on them (Ctrl-C would cancel the line typed so
+  // far and run what follows), whatever the shell quoting around them.
+  session.terminalInput(terminalId, `${line.replace(/[\x00-\x1f\x7f]+/g, " ")}\r`);
 }

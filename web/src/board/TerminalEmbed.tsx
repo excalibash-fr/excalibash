@@ -10,7 +10,9 @@ import { confirmDialog, toast, useTheme } from "../components/ui.tsx";
 import type { TermColors } from "../themes.ts";
 import { iconUrl, type TileIcon } from "./personalLibrary.ts";
 import { TileCustomizer, type TilePatch } from "./TileCustomizer.tsx";
-import { CastRecorder, bufferToText, exportName, saveBlob } from "./termTools.ts";
+import { CastRecorder, bufferToText, exportName } from "./termTools.ts";
+import { saveBlob } from "../download.ts";
+import { fmtBytes } from "../format.ts";
 import { FileClient, type Signal } from "./fileTransfer.ts";
 import { FilesPanel } from "./FilesPanel.tsx";
 import { clearBroadcast, fanOut, liveTargets, setBroadcast, toggleBroadcast, useBroadcastGroup } from "./broadcast.ts";
@@ -521,7 +523,7 @@ export function TerminalEmbed({ session, terminalId, active, collapsed, title, i
         {xfer && (
           <span className="term-xfer" title={xfer.name}>
             <progress max={xfer.total ?? undefined} value={xfer.total ? xfer.done : undefined} />
-            <span>{xfer.total ? `${Math.floor((xfer.done / Math.max(xfer.total, 1)) * 100)} %` : `${(xfer.done / 1024 ** 2).toFixed(1)} Mio`}</span>
+            <span>{xfer.total ? `${Math.floor((xfer.done / Math.max(xfer.total, 1)) * 100)} %` : fmtBytes(xfer.done)}</span>
             <button title="Annuler le transfert" onClick={cancelTransfer}>
               <X size={11} />
             </button>

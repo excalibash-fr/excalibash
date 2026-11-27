@@ -10,6 +10,7 @@
 // everybody like a notebook's), `running` (id of the run in flight) and `runCount` (the kernel's counter).
 import * as Y from "yjs";
 import { isTermId, validOutput, type NbOutput, type RunSink } from "./notebookDoc.ts";
+import { sha256Hex } from "../crypto.ts";
 
 export type CodeMeta = {
   path?: string;
@@ -103,8 +104,8 @@ export function languageForName(name: string): string {
 
 export const isLanguage = (id: unknown): id is string => typeof id === "string" && LANGUAGES.some((l) => l.id === id);
 
-const hex = (b: ArrayBuffer) => [...new Uint8Array(b)].map((x) => x.toString(16).padStart(2, "0")).join("");
-export const sha256Hex = async (text: string): Promise<string> => hex(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text)));
+/** SHA-256 (hex) of a document's text; re-exported for the editor windows. */
+export { sha256Hex };
 /** SHA-256 of the empty string: what a document that was never saved is compared to. */
 export const EMPTY_SHA = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
@@ -134,7 +135,8 @@ export function runCommand(path: string, language: string): string | null {
 
 /** Document metadata as stored in the shared map (any editor can write it: read it defensively). */
 export function readMeta(meta: { get(k: string): unknown }): CodeMeta {
-  const s = (v: unknown) => (typeof v === "string" && v.length <= 4096 ? v : undefined);
+  // No control characters: the path ends up in commands typed into a shell.
+  const s = (v: unknown) => (typeof v === "string" && v.length <= 4096 && !/[\x00-\x1f\x7f]/.test(v) ? v : undefined);
   const n = (v: unknown) => (typeof v === "number" && Number.isFinite(v) ? v : undefined);
   const sha = (v: unknown) => (typeof v === "string" && /^[0-9a-f]{64}$/.test(v) ? v : undefined);
   const name = s(meta.get("name")) || "sans-titre";
@@ -294,4 +296,12 @@ export function cursorStyleSheet(peers: { clientId: number; name: unknown; color
       ].join("\n");
     })
     .join("\n");
+}
+
+/** What the user picked in the diff shown on a save conflict. */
+export type DiffChoice = "overwrite" | "take" | "cancel";
+
+/** What a choice does: write the document anyway, and/or replace the document by the machine version. */
+export function diffOutcome(choice: DiffChoice): { save: boolean; adopt: boolean } {
+  return { save: choice === "overwrite", adopt: choice === "take" };
 }

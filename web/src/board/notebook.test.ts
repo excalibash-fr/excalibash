@@ -402,6 +402,8 @@ const SAMPLE_TEXT = JSON.stringify(SAMPLE, null, 1) + "\n";
   ra.attach(TERM);
   rb.attach(TERM);
   ok(ra.status === "idle" && rb.status === "idle", "noyau : l'état vient du flux rejoué");
+  ok(sent.length === 2 && sent.every((l) => JSON.parse(l).op === "ping"), "noyau : chaque éditeur envoie un ping en s'attachant");
+  sent.length = 0;
   const r = ra.run(cell);
   ok(r.ok && sent.length === 1 && JSON.parse(sent[0]).op === "exec" && JSON.parse(sent[0]).code === "print(41 + 1)" && JSON.parse(sent[0]).id === (r.ok ? r.execId : ""), "noyau : l'exécuteur envoie une seule ligne exec");
   ok(findCell(b, cell)!.running === (r.ok ? r.execId : "") && JSON.stringify(awA.states.get(1).execs) === JSON.stringify([r.ok ? r.execId : ""]), "noyau : `running` est visible chez l'autre, l'identifiant est annoncé dans la présence");
@@ -491,6 +493,7 @@ const SAMPLE_TEXT = JSON.stringify(SAMPLE, null, 1) + "\n";
   const p3 = { subscribe: (_t: string, _l: L) => () => {}, input: (_t: string, d: Uint8Array) => void frames.push(d.slice()) };
   const rf = new NotebookRunner(d3, p3, { canEdit: true });
   rf.attach(TERM);
+  frames.length = 0; // the ping sent on attach
   ok(rf.run(big).ok && frames.length > 4 && frames.every((f) => f.length <= 48 * 1024), "noyau : un long code part en plusieurs trames (48 Kio au plus)");
   const joined = new LineSplitter().push(new Uint8Array(frames.flatMap((f) => [...f])));
   ok(joined.length === 1 && JSON.parse(joined[0]).code === findCell(d3, big)!.source.toString(), "noyau : …qui se recollent en une seule ligne JSON identique (UTF-8 intact)");
@@ -557,6 +560,7 @@ const SAMPLE_TEXT = JSON.stringify(SAMPLE, null, 1) + "\n";
   setKernelTerm(win.doc.ydoc, TERM);
   emit({ ev: "status", state: "idle" });
   ok(win.runner.term === TERM, "service : le runner suit la session de noyau du document, sans fenêtre pour le lui dire");
+  sent.length = 0; // the ping sent on attach
   const run = win.runner.run(cell);
   ok(run.ok && sent.length === 1, "service : la cellule part au noyau");
   const execId = run.ok ? run.execId : "";
@@ -865,6 +869,7 @@ const SAMPLE_TEXT = JSON.stringify(SAMPLE, null, 1) + "\n";
   ra.attach(TERM);
   rb.attach(TERM);
   emit({ ev: "status", state: "idle" });
+  sent.length = 0; // the pings sent on attach
   const r = ra.run(a.getText("content").toString());
   const execId = r.ok ? r.execId : "";
   ok(r.ok && sent.length === 1 && sent[0].op === "exec" && sent[0].code === "print(6 * 7)\n" && sent[0].id === execId, "code : la ligne exec porte le contenu actuel de la fenêtre");
@@ -955,6 +960,220 @@ const SAMPLE_TEXT = JSON.stringify(SAMPLE, null, 1) + "\n";
   await nap(400);
   ok(win.disposed, "code : service libéré une fois inactif");
   closeBoard?.();
+}
+
+// 13. Moving a running cell keeps its run: the later events of the executor are still written
+{
+  const enc = new TextEncoder();
+  type L = { onReplay(d: Uint8Array): void; onData(d: Uint8Array): void };
+  const listeners = new Set<L>();
+  const lines: string[] = [];
+  const emit = (ev: object) => {
+    const line = JSON.stringify(ev) + "\n";
+    lines.push(line);
+    for (const l of listeners) l.onData(enc.encode(line));
+  };
+  const port = {
+    subscribe(_t: string, l: L) {
+      listeners.add(l);
+      l.onReplay(enc.encode(lines.join("")));
+      return () => listeners.delete(l);
+    },
+    input() {},
+  };
+  const aw = { states: new Map<number, any>(), getStates() { return this.states; }, setLocalStateField(k: string, v: unknown) { this.states.set(1, { ...(this.states.get(1) ?? {}), [k]: v }); } };
+  const d = new Y.Doc();
+  initBlankNotebook(d);
+  const id = ids(d)[0];
+  findCell(d, id)!.source.insert(0, "1");
+  insertCell(d, { type: "code", at: "start" });
+  emit({ ev: "status", state: "idle" });
+  const r = new NotebookRunner(d, port, { awareness: aw, canEdit: true });
+  r.attach("M".repeat(22));
+  const x = r.run(id);
+  const ex = x.ok ? x.execId : "";
+  emit({ ev: "stream", id: ex, name: "stdout", text: "a\n" });
+  await nap(120);
+  ok(moveCell(d, id, -1) && ids(d)[0] === id && findCell(d, id)!.running === ex, "cellules : déplacer une cellule en cours garde son exécution");
+  emit({ ev: "stream", id: ex, name: "stdout", text: "b\n" });
+  emit({ ev: "done", id: ex, count: 2, status: "ok" });
+  await nap(120);
+  const texts = findCell(d, id)!.outputs.map((o) => o.text ?? o.output_type).join("|");
+  ok(texts === "a\nb\n", `cellules : …et ses sorties suivantes arrivent (${JSON.stringify(texts)})`);
+  ok(findCell(d, id)!.executionCount === 2 && !findCell(d, id)!.running, "cellules : …et elle se termine");
+  r.destroy();
+}
+
+// 14. Runner: replays, lost requests, kernel switch
+{
+  const enc = new TextEncoder();
+  type L = { onReplay(d: Uint8Array): void; onData(d: Uint8Array): void };
+  const TERM = "K".repeat(22);
+  function fakeKernel() {
+    const listeners = new Set<L>();
+    const lines: string[] = [];
+    const sent: any[] = [];
+    let drop = false;
+    return {
+      lines,
+      sent,
+      set drop(v: boolean) {
+        drop = v;
+      },
+      emit(ev: object) {
+        const line = JSON.stringify(ev) + "\n";
+        lines.push(line);
+        for (const l of listeners) l.onData(enc.encode(line));
+      },
+      /** A reconnection: the server replays its scrollback (the lines from `from` on). */
+      replay(from = 0) {
+        for (const l of listeners) l.onReplay(enc.encode(lines.slice(from).join("")));
+      },
+      port: {
+        subscribe(_t: string, l: L) {
+          listeners.add(l);
+          l.onReplay(enc.encode(lines.join("")));
+          return () => listeners.delete(l);
+        },
+        input(_t: string, d: Uint8Array) {
+          if (drop) return;
+          for (const line of new TextDecoder().decode(d).split("\n")) if (line) sent.push(JSON.parse(line));
+        },
+      },
+    };
+  }
+  const aw = () => ({ states: new Map<number, any>(), getStates() { return this.states; }, setLocalStateField(k: string, v: unknown) { this.states.set(1, { ...(this.states.get(1) ?? {}), [k]: v }); } });
+  const newNb = (code: string) => {
+    const d = new Y.Doc();
+    initBlankNotebook(d);
+    const id = ids(d)[0];
+    findCell(d, id)!.source.insert(0, code);
+    return { d, id };
+  };
+  const texts = (d: Y.Doc, id: string) => findCell(d, id)!.outputs.map((o) => o.text ?? o.output_type).join("|");
+
+  // Starting: no status in the scrollback → "starting" until the kernel answers the ping.
+  {
+    const k = fakeKernel();
+    const { d } = newNb("1");
+    const r = new NotebookRunner(d, k.port, { canEdit: true });
+    r.attach(TERM);
+    ok(r.status === "starting" && k.sent.length === 1 && k.sent[0].op === "ping", "noyau : sans état dans le flux rejoué, le noyau reste « démarrage » (ping envoyé)");
+    k.emit({ ev: "pong" });
+    ok(r.status === "idle", "noyau : la réponse au ping montre que le noyau est prêt");
+    const v = new NotebookRunner(d, k.port, { canEdit: false });
+    const before = k.sent.length;
+    v.attach(TERM);
+    ok(k.sent.length === before, "noyau : un lecteur n'envoie pas de ping");
+    v.destroy();
+    r.destroy();
+  }
+
+  // A reconnection replays the whole scrollback: the outputs of an in-flight run are rebuilt, not doubled.
+  {
+    const k = fakeKernel();
+    k.emit({ ev: "status", state: "idle" });
+    const { d, id } = newNb("for i in range(3): print(i)");
+    const r = new NotebookRunner(d, k.port, { awareness: aw(), canEdit: true });
+    r.attach(TERM);
+    const x = r.run(id);
+    const ex = x.ok ? x.execId : "";
+    k.emit({ ev: "status", state: "busy" });
+    k.emit({ ev: "stream", id: ex, name: "stdout", text: "0\n" });
+    k.emit({ ev: "display", id: ex, data: { "text/plain": "<fig>" }, metadata: {}, display_id: "d1" });
+    await nap(120);
+    k.emit({ ev: "stream", id: ex, name: "stdout", text: "1\n" });
+    k.replay();
+    await nap(120);
+    ok(texts(d, id) === "0\n|display_data|1\n", `noyau : reconnexion → sorties reconstruites depuis le flux rejoué, sans doublon (${texts(d, id)})`);
+    k.emit({ ev: "update", id: ex, display_id: "d1", data: { "text/plain": "<fig2>" }, metadata: {} });
+    k.emit({ ev: "stream", id: ex, name: "stdout", text: "2\n" });
+    k.emit({ ev: "done", id: ex, count: 7, status: "ok" });
+    await nap(120);
+    const end = findCell(d, id)!;
+    ok(!end.running && end.executionCount === 7 && texts(d, id) === "0\n|display_data|1\n2\n" && end.outputs[1]?.data?.["text/plain"] === "<fig2>", `noyau : fin normale après la reconnexion (${texts(d, id)})`);
+    r.destroy();
+
+    const k2 = fakeKernel();
+    k2.emit({ ev: "status", state: "idle" });
+    const nb2 = newNb("x");
+    const r2 = new NotebookRunner(nb2.d, k2.port, { awareness: aw(), canEdit: true });
+    r2.attach(TERM);
+    const y = r2.run(nb2.id);
+    const ey = y.ok ? y.execId : "";
+    k2.emit({ ev: "stream", id: ey, name: "stdout", text: "a\n" });
+    await nap(120);
+    const cut = k2.lines.length;
+    k2.emit({ ev: "stream", id: ey, name: "stdout", text: "b\n" });
+    await nap(120);
+    k2.emit({ ev: "done", id: ey, count: 3, status: "ok" });
+    // Replay of a truncated scrollback (without "a"), the `done` included, before the live `done` is flushed.
+    k2.replay(cut);
+    await nap(120);
+    ok(texts(nb2.d, nb2.id) === "a\nb\n" && !findCell(nb2.d, nb2.id)!.running && findCell(nb2.d, nb2.id)!.executionCount === 3, `noyau : flux rejoué tronqué → rien n'est réécrit, seule la fin est prise (${texts(nb2.d, nb2.id)})`);
+    r2.destroy();
+  }
+
+  // The same for a code window.
+  {
+    const k = fakeKernel();
+    k.emit({ ev: "status", state: "idle" });
+    const d = new Y.Doc();
+    initBlank(d, "a.py");
+    const r = new CodeRunner(d, k.port, { awareness: aw(), canEdit: true });
+    r.attach(TERM);
+    const x = r.run("print(1)");
+    const ex = x.ok ? x.execId : "";
+    k.emit({ ev: "stream", id: ex, name: "stdout", text: "1\n" });
+    await nap(120);
+    k.replay();
+    k.emit({ ev: "done", id: ex, count: 1, status: "ok" });
+    await nap(120);
+    ok(readOutputs(d).map((o) => o.text).join("|") === "1\n" && !readCodeMeta(d.getMap("meta")).running, `code : reconnexion → sorties sans doublon (${readOutputs(d).map((o) => o.text).join("|")})`);
+    r.destroy();
+  }
+
+  // The request was lost (socket down): once the kernel has been idle for 15 s, the run ends with an error.
+  {
+    const k = fakeKernel();
+    k.emit({ ev: "status", state: "idle" });
+    const { d, id } = newNb("1");
+    const a = aw();
+    const r = new NotebookRunner(d, k.port, { awareness: a, canEdit: true });
+    r.attach(TERM);
+    k.drop = true;
+    ok(r.run(id).ok, "noyau : lancement pendant une coupure");
+    r.sweep(Date.now() + 5000);
+    ok(!!findCell(d, id)!.running, "noyau : pas d'abandon avant 15 s");
+    k.emit({ ev: "status", state: "busy" });
+    r.sweep(Date.now() + 20000);
+    ok(!!findCell(d, id)!.running, "noyau : pas d'abandon tant que le noyau est occupé (la cellule est peut-être en file)");
+    k.emit({ ev: "status", state: "idle" });
+    r.sweep(Date.now() + 20000);
+    const c = findCell(d, id)!;
+    ok(!c.running && c.outputs.at(-1)?.ename === "ExecutionLost" && r.localRuns.length === 0 && JSON.stringify(a.states.get(1).execs) === "[]", "noyau : requête perdue → l'exécution se termine par une erreur explicite");
+    r.destroy();
+  }
+
+  // Following no kernel (attach(null), e.g. the document now names a shell) or another one ends the own runs.
+  {
+    const k = fakeKernel();
+    k.emit({ ev: "status", state: "idle" });
+    const { d, id } = newNb("import time; time.sleep(60)");
+    const a = aw();
+    const r = new NotebookRunner(d, k.port, { awareness: a, canEdit: true });
+    r.attach(TERM);
+    const x = r.run(id);
+    k.emit({ ev: "stream", id: x.ok ? x.execId : "", name: "stdout", text: "avant\n" });
+    r.attach(null);
+    const c = findCell(d, id)!;
+    ok(!c.running && c.outputs[0]?.text === "avant\n" && c.outputs.at(-1)?.ename === "KernelStopped" && JSON.stringify(a.states.get(1).execs) === "[]" && r.status === "absent" && !r.run(id).ok, "noyau : ne plus suivre le noyau termine les exécutions en cours (sortie reçue gardée, erreur, présence vidée)");
+    r.attach(TERM);
+    const y = r.run(id);
+    r.attach("L".repeat(22));
+    ok(y.ok && !findCell(d, id)!.running && r.localRuns.length === 0, "noyau : passer à un autre noyau termine aussi les exécutions de l'ancien");
+    r.destroy();
+  }
 }
 
 if (failures) {

@@ -34,7 +34,7 @@ Les mêmes vérifications tournent automatiquement sur chaque pull request :
 ./tests/run.sh
 ```
 
-`./tests/run.sh` lance un serveur jetable, un agent réel et deux utilisateurs : partage, terminaux chiffrés, tunnels web, droits de l'admin et rotation des clés. Il doit se terminer par `TOUT EST OK`.
+`./tests/run.sh` lance un serveur jetable, un agent réel et deux utilisateurs : partage, terminaux chiffrés, tunnels web, droits de l'admin et rotation des clés. Il doit se terminer par `TOUT EST OK`. Il lance aussi `tests/tunnel-host.mts` (tunnels web en mode sous-domaine, avec un second serveur jetable ; compter une minute d'attente) et `tests/tls.mts`.
 
 Il enchaîne ensuite `tests/browser.mts` : l'application construite (`web/dist`) est pilotée dans un vrai Chrome (Playwright, `playwright-core` sans téléchargement de navigateur) contre un second serveur jetable et l'agent réel. Il couvre l'inscription, le tableau de bord, l'appairage d'une machine, un terminal, une fenêtre de code et un notebook à deux navigateurs, la diffusion de saisie, l'historique et le lien public ; toute erreur console ou exception de page fait échouer le test. Chrome est cherché dans `CHROME_PATH` puis dans le `PATH` (ignoré en local s'il manque, obligatoire en CI) ; le notebook demande `ipykernel` et `jupyter_client`. Les captures d'écran d'un échec sont écrites dans le dossier `shots` affiché.
 

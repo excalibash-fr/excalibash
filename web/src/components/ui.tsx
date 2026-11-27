@@ -16,6 +16,7 @@ import {
   type ThemeDef,
 } from "../themes.ts";
 import { createPortal } from "react-dom";
+import { readJson, readStorage, writeStorage } from "../storage.ts";
 
 // ---- Theme ------------------------------------------------------------------------
 // One light theme and one dark theme, each chosen in "Mon compte" (built-in or custom); the
@@ -44,44 +45,23 @@ type ThemeCtx = {
 
 const ThemeContext = createContext<ThemeCtx>(null as unknown as ThemeCtx);
 
-const read = (key: string): string | null => {
-  try {
-    return localStorage.getItem(key);
-  } catch {
-    return null;
-  }
-};
-const write = (key: string, value: string) => {
-  try {
-    localStorage.setItem(key, value);
-  } catch {
-    /* private mode */
-  }
-};
-
 function initialState() {
-  const raw = read(MODE_KEY);
+  const raw = readStorage(MODE_KEY);
   // A theme id stored there by an earlier version: it becomes the theme of its base, shown.
   const legacy = raw && raw !== "light" && raw !== "dark" && raw !== "auto" ? themeById(raw) : undefined;
   const mode: Mode = raw === "light" || raw === "dark" ? raw : legacy ? legacy.base : "auto";
   // Rewritten at once (mode and the theme of its base), so that boot.js agrees from the next
   // load on and the first toggle does not lose the theme.
   if (legacy) {
-    write(MODE_KEY, mode);
-    if (!read(SLOT_KEY[legacy.base])) write(SLOT_KEY[legacy.base], legacy.id);
+    writeStorage(MODE_KEY, mode);
+    if (!readStorage(SLOT_KEY[legacy.base])) writeStorage(SLOT_KEY[legacy.base], legacy.id);
   }
   const slot = (base: Base) => {
-    const v = read(SLOT_KEY[base]);
+    const v = readStorage(SLOT_KEY[base]);
     if (v === CUSTOM_ID[base] || (v && themeById(v)?.base === base)) return v;
     return legacy?.base === base ? legacy.id : base;
   };
-  const custom = (base: Base) => {
-    try {
-      return readCustom(JSON.parse(read(CUSTOM_KEY[base]) ?? "null"), base);
-    } catch {
-      return readCustom(null, base);
-    }
-  };
+  const custom = (base: Base) => readCustom(readJson(CUSTOM_KEY[base]), base);
   return { mode, slots: { light: slot("light"), dark: slot("dark") }, custom: { light: custom("light"), dark: custom("dark") } };
 }
 
@@ -120,16 +100,16 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
 
   const setMode = useCallback((m: Mode) => {
     setModeState(m);
-    write(MODE_KEY, m);
+    writeStorage(MODE_KEY, m);
   }, []);
   const setSlot = useCallback((b: Base, id: string) => {
     setSlots((s) => ({ ...s, [b]: id }));
-    write(SLOT_KEY[b], id);
+    writeStorage(SLOT_KEY[b], id);
   }, []);
   const setCustom = useCallback((b: Base, c: CustomColors) => {
     const v = readCustom(c, b);
     setCustomState((s) => ({ ...s, [b]: v }));
-    write(CUSTOM_KEY[b], JSON.stringify(v));
+    writeStorage(CUSTOM_KEY[b], JSON.stringify(v));
   }, []);
   const toggle = useCallback(() => setMode(base === "dark" ? "light" : "dark"), [base, setMode]);
   const value = useMemo(

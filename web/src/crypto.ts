@@ -26,12 +26,38 @@ export function fromB64(s: string): Bytes {
 export const utf8 = (s: string): Bytes => enc.encode(s) as Bytes;
 export const fromUtf8 = (b: Uint8Array): string => dec.decode(b);
 
+/** Lowercase hex of the bytes. */
+export const hex = (buf: ArrayBuffer | Uint8Array): string => Array.from(buf instanceof Uint8Array ? buf : new Uint8Array(buf), (x) => x.toString(16).padStart(2, "0")).join("");
+
+/** SHA-256 as lowercase hex; a string is hashed as UTF-8. */
+export const sha256Hex = async (data: BufferSource | string): Promise<string> => hex(await subtle.digest("SHA-256", typeof data === "string" ? utf8(data) : data));
+
 export function randomBytes(n: number): Bytes {
   return globalThis.crypto.getRandomValues(new Uint8Array(n));
 }
 
 /** Ids generated client-side and bound into AADs. */
 export const randomId = (): string => toB64(randomBytes(16));
+
+/** Tunnel id: 128 random bits as lowercase base32 without padding (26 characters), valid as a hostname label. */
+export function randomTunnelId(): string {
+  const alphabet = "abcdefghijklmnopqrstuvwxyz234567";
+  const bytes = randomBytes(16);
+  let out = "";
+  let bits = 0;
+  let acc = 0;
+  for (const b of bytes) {
+    acc = (acc << 8) | b;
+    bits += 8;
+    while (bits >= 5) {
+      out += alphabet[(acc >>> (bits - 5)) & 31];
+      bits -= 5;
+    }
+    acc &= (1 << bits) - 1;
+  }
+  if (bits > 0) out += alphabet[(acc << (5 - bits)) & 31];
+  return out;
+}
 
 function concat(...parts: Uint8Array[]): Bytes {
   const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
@@ -192,8 +218,7 @@ export async function pairTag(confirm: string, auth: Uint8Array, agentPub: Uint8
 
 export async function fingerprint(pub: Uint8Array): Promise<string> {
   const h = new Uint8Array(await subtle.digest("SHA-256", pub as Bytes)).subarray(0, 20);
-  const hex = [...h].map((x) => x.toString(16).padStart(2, "0")).join("").toUpperCase();
-  return hex.match(/.{4}/g)!.join(" ");
+  return hex(h).toUpperCase().match(/.{4}/g)!.join(" ");
 }
 
 // ---- Accounts ------------------------------------------------------------------------

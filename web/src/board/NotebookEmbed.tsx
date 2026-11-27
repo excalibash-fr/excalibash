@@ -6,6 +6,7 @@
 // Outputs are DATA written by whatever code anybody ran: text becomes text nodes, images <img data:>
 // after a base64 check, everything else (HTML, SVG, Markdown, JavaScript) a sandboxed iframe
 // (sandbox="", no script, no same-origin). Nothing here uses innerHTML or runs notebook-provided code.
+import { saveBlob } from "../download.ts";
 import { memo, useCallback, useEffect, useMemo, useReducer, useRef, useState, useSyncExternalStore } from "react";
 import {
   ArrowDown,
@@ -68,6 +69,7 @@ import { Outputs } from "./OutputView.tsx";
 import type { NotebookRunner } from "./notebookRunner.ts";
 import { acquireNotebook, sessionEnv } from "./notebookService.ts";
 import { bindPythonKernel, type KernelQuery } from "./pyKernel.ts";
+import { applyEditorSettings, useEditorSettings } from "./editorSettings.ts";
 
 /** What the window needs from the app (handed in by the board page: this chunk must not import the UI kit, see BoardPage). */
 export type NotebookHost = {
@@ -298,6 +300,11 @@ const NotebookCell = memo(function NotebookCell(p: CellProps) {
     // The editor is rebuilt for another cell kind or when it scrolls in / out of range; theme and read-only are applied below.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [wantEditor, source, language, editing]);
+  // Local editor preferences (after the creation effect, so they win over the kernel's suggestion defaults).
+  const { settings: editorPrefs } = useEditorSettings();
+  useEffect(() => {
+    if (editorRef.current) applyEditorSettings(editorRef.current, editorPrefs, true, language !== "python");
+  }, [editorPrefs, wantEditor, source, language, editing]);
   useEffect(() => {
     monaco.editor.setTheme(p.theme === "dark" ? "vs-dark" : "vs");
   }, [p.theme]);
@@ -741,11 +748,7 @@ export default function NotebookEmbed({ host, session, docId, nodeId, active, sh
 
   const download = () => {
     if (!doc) return;
-    const a = document.createElement("a");
-    a.href = URL.createObjectURL(new Blob([exportIpynb(doc.ydoc)], { type: "application/x-ipynb+json" }));
-    a.download = meta.name.endsWith(".ipynb") ? meta.name : `${meta.name}.ipynb`;
-    a.click();
-    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+    saveBlob(new Blob([exportIpynb(doc.ydoc)], { type: "application/x-ipynb+json" }), meta.name.endsWith(".ipynb") ? meta.name : `${meta.name}.ipynb`);
   };
 
   // ---- render ------------------------------------------------------------------------------------------------------------------
@@ -761,6 +764,8 @@ export default function NotebookEmbed({ host, session, docId, nodeId, active, sh
   const kernelClass = !kernelTerm || termGone || kStatus.status === "dead" ? "off" : kStatus.status === "busy" || kStatus.status === "restarting" || kStatus.status === "starting" ? "busy" : "on";
   const kernelTitle = machine ? `Noyau Python sur ${machine.name}` : "Tu n'as pas accès à la clé de cette machine : seuls ceux qui y ont accès peuvent démarrer un noyau";
   const startLabel = kernelTerm ? "Redémarrer le noyau" : "Démarrer le noyau";
+  // The bridge is alive but its kernel is not (failed restart): a new kernel session replaces it.
+  const kernelDead = !!kernelTerm && !termGone && kStatus.status === "dead";
 
   return (
     <div className={`term notebook ${active ? "active" : ""}`} ref={rootRef} style={{ ["--term-bg" as any]: bg }}>
@@ -836,9 +841,9 @@ export default function NotebookEmbed({ host, session, docId, nodeId, active, sh
           <span className="dot" />
           {kernelText}
         </span>
-        {(!kernelTerm || termGone) && !readOnly && (
+        {(!kernelTerm || termGone || kernelDead) && !readOnly && (
           <button className="nb-start" title={machine ? `${startLabel} sur ${machine.name}` : kernelTitle} disabled={!machine || !!busy || !ready} onClick={() => void startKernel()}>
-            <Power size={13} /> {termGone ? "Redémarrer le noyau" : "Démarrer le noyau"}
+            <Power size={13} /> {kernelTerm ? "Redémarrer le noyau" : "Démarrer le noyau"}
           </button>
         )}
         {kernelTerm && !termGone && !readOnly && (
@@ -847,7 +852,7 @@ export default function NotebookEmbed({ host, session, docId, nodeId, active, sh
           </button>
         )}
       </div>
-      {(termGone || kStatus.fatal) && kernelTerm && (
+      {(termGone || kernelDead || kStatus.fatal) && kernelTerm && (
         <div className="nb-banner">
           Noyau arrêté{kStatus.fatal ? ` : ${kStatus.fatal}` : ""}
           {!machine && " — seuls ceux qui ont accès à la machine peuvent le relancer"}

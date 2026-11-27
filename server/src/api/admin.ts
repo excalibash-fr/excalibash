@@ -8,9 +8,11 @@ import { subtree, type ItemRow } from "../access.ts";
 import { disconnectUserMachines, dropBoardTerminals, dropMachine, isMachineOnline } from "../terminals.ts";
 import { dropBoardTunnels, dropMachineTunnels } from "../tunnels.ts";
 import { evictRoom, kickUser } from "../rooms.ts";
+import { dropUserTunnelSessions } from "../tunnelSessions.ts";
 import { HttpError, pid, publicUrl, str } from "../http.ts";
 import { newInviteToken } from "./auth.ts";
 import { sendTestMail, smtpStatus } from "../mailer.ts";
+import { isEmail } from "../validate.ts";
 
 /**
  * Administration is deliberately narrow: admins manage *accounts*, never content.
@@ -122,7 +124,7 @@ adminApi.get("/smtp", (_req, res) => {
 /** Sends a test email (to the admin by default) and reports the SMTP server's answer. */
 adminApi.post("/smtp/test", async (req, res) => {
   const to = str(req.body?.to, 254) || req.user!.email;
-  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(to)) throw new HttpError(400, "Adresse email invalide");
+  if (!isEmail(to)) throw new HttpError(400, "Adresse email invalide");
   if (smtpStatus().mode === "off") throw new HttpError(400, "Aucun serveur SMTP configuré (variable SMTP_HOST)");
   const started = Date.now();
   try {
@@ -160,11 +162,13 @@ adminApi.patch("/users/:id", (req, res) => {
   if (typeof isAdmin === "boolean") {
     db.prepare("UPDATE users SET is_admin = ? WHERE id = ?").run(isAdmin ? 1 : 0, id);
     db.prepare("DELETE FROM sessions WHERE user_id = ?").run(id);
+    dropUserTunnelSessions(id);
   }
   if (typeof suspended === "boolean") {
     db.prepare("UPDATE users SET suspended = ? WHERE id = ?").run(suspended ? 1 : 0, id);
     if (suspended) {
       db.prepare("DELETE FROM sessions WHERE user_id = ?").run(id);
+      dropUserTunnelSessions(id);
       kickUser(id, 4403, "compte suspendu");
       disconnectUserMachines(id);
     }
@@ -175,6 +179,7 @@ adminApi.patch("/users/:id", (req, res) => {
 /** Removes a user and everything they own, closing live rooms, terminals and tunnels first. */
 export function purgeUser(id: string): void {
   kickUser(id, 4403, "compte supprimé");
+  dropUserTunnelSessions(id);
   const roots = db.prepare("SELECT * FROM items WHERE owner_id = ? AND parent_id IS NULL").all(id) as ItemRow[];
   for (const root of roots) {
     for (const i of subtree(root.id)) {

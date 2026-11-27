@@ -556,7 +556,7 @@ new WebSocketServer({ server: site, handleProtocols: (p: Set<string>) => (p.has(
 });
 await new Promise<void>((r) => site.listen(0, "127.0.0.1", () => r()));
 const sitePort = (site.address() as any).port;
-const wid = c.randomId();
+const wid = c.randomTunnelId();
 const kwA = await c.newSymKey();
 const siteUrl = `http://127.0.0.1:${sitePort}`;
 sa.send({
@@ -2064,8 +2064,10 @@ if (process.env.UPDATE_V1_BIN && process.env.UPDATE_SIGN && process.env.UPDATE_K
     const goneBob = await until(() => bobErrors.length > wasGone && bobErrors.some((e) => /supprimé/.test(e)), 6000);
     ok(goneBob && !docsRows(D).some((r) => r.doc_id === nbId) && upRows(D, nbId) === 0 && docsRows(D).filter((r) => r.doc_id !== nbId).length === otherDocs, "documents : doc.del supprime les lignes du document (et d'elles seules) et prévient les abonnés (doc.gone)");
     sDel.send({ t: "doc.sub", doc: nbId });
-    const reSub = await sDel.next((m) => m.t === "doc.state", 4000);
-    ok(!reSub.snap && reSub.ups.length === 0, "documents : un document supprimé se réabonne vide");
+    // Deleted for good: a later subscription (or a stale client pushing its local copy) gets doc.gone,
+    // the document is not recreated.
+    const reSub = await sDel.next((m) => (m.t === "doc.state" || m.t === "doc.gone") && m.doc === nbId, 4000);
+    ok(reSub.t === "doc.gone" && !docsRows(D).some((r) => r.doc_id === nbId), "documents : un document supprimé ne revient pas (doc.gone au réabonnement)");
     // ---- Duplicating a board copies its documents (re-sealed under the copy's own key) ----
     {
       const dupNb = sd.newDocId();

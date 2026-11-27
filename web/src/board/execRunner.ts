@@ -9,6 +9,12 @@
 // If the executor leaves mid-run, any editor that sees a run marked in the document under an id that is in
 // nobody's awareness for 5 s finalizes it once the kernel is idle (or the `done` of that id went by).
 // Output events produced after the executor left are not recorded.
+//
+// The stream is replayed (the server's scrollback) on every subscription, reconnections included. The executor
+// rebuilds the outputs of its in-flight runs from the replay when it holds their first event, and only takes
+// their `done` from it otherwise (the scrollback lost the start: what was written stays).
+// An own run never stays marked forever: leaving the session ends it (attach to another one or to none), and
+// a run with no event for 15 s while the kernel has been idle for 15 s ends with an `ExecutionLost` error.
 import type * as Y from "yjs";
 import { encodeOp, type KernelEvent } from "./kernelProtocol.ts";
 import { KernelSession, type TermPort } from "./kernelSession.ts";
@@ -26,8 +32,19 @@ const FLUSH_MS = 80;
 const BATCH_BUDGET = 160 * 1024;
 const ORPHAN_MS = 5000;
 const SWEEP_MS = 1500;
+/** An own run with no event for this long while the kernel is idle was lost (request never reached it). */
+const LOST_MS = 15_000;
 
-type Exec = { slot: string; st: WriteState; queue: KernelEvent[]; timer?: ReturnType<typeof setTimeout> };
+type Exec = {
+  slot: string;
+  st: WriteState;
+  queue: KernelEvent[];
+  timer?: ReturnType<typeof setTimeout>;
+  /** When the run was sent or last got an event. */
+  last: number;
+  /** Its first event line, to know whether a replay holds the whole run. */
+  first?: string;
+};
 
 export abstract class ExecRunner extends KernelSession {
   protected ydoc: Y.Doc;
@@ -36,6 +53,8 @@ export abstract class ExecRunner extends KernelSession {
   private foreignDone = new Map<string, number | null>();
   private orphanSince = new Map<string, number>();
   private sweeper: ReturnType<typeof setInterval> | undefined;
+  /** Own runs whose start is missing from the scrollback being replayed: only their `done` is taken. */
+  private doneOnly = new Set<string>();
 
   constructor(ydoc: Y.Doc, port: TermPort, o: { awareness?: AwarenessLike; canEdit: boolean }) {
     super(port, o.canEdit);
@@ -59,12 +78,38 @@ export abstract class ExecRunner extends KernelSession {
   protected abstract runningIds(): string[];
   /** Ends a run whose executor is gone; the count when its `done` was seen. */
   protected abstract finishOrphan(execId: string, count: number | null | undefined): void;
+  /** Empties the outputs of the run `execId` if it is still marked in the document (rebuilt from a replay). */
+  protected abstract resetOutputs(slot: string, execId: string): void;
 
-  protected onEvent(ev: KernelEvent) {
+  protected beforeReplay(lines: ReadonlySet<string>) {
+    this.doneOnly.clear();
+    for (const [id, ex] of this.execs) {
+      if (ex.first !== undefined && !lines.has(ex.first)) {
+        // The start of the run is no longer in the scrollback: keep what was written, only take its end.
+        this.doneOnly.add(id);
+        continue;
+      }
+      // The replay holds the whole run: rebuild its outputs from scratch (no event is applied twice).
+      if (ex.timer) clearTimeout(ex.timer);
+      ex.timer = undefined;
+      ex.queue = [];
+      ex.st = newWriteState();
+      try {
+        this.resetOutputs(ex.slot, id);
+      } catch (e) {
+        console.error("[excalibash]", e);
+      }
+    }
+  }
+
+  protected onEvent(ev: KernelEvent, line: string, replayed: boolean) {
     const id = (ev as { id?: unknown }).id;
     if (typeof id !== "string") return;
     const ex = this.execs.get(id);
     if (ex) {
+      ex.last = Date.now();
+      if (ex.first === undefined) ex.first = line;
+      if (replayed && this.doneOnly.has(id) && ev.ev !== "done") return;
       ex.queue.push(ev);
       this.schedule(id, ex);
     } else if (ev.ev === "done") {
@@ -142,7 +187,7 @@ export abstract class ExecRunner extends KernelSession {
     begin: (execId: string) => { ok: true } | { ok: false; reason: string },
   ): RunResult {
     if (!this.canEdit) return { ok: false, reason: "Lecture seule" };
-    if (!this.term || this.status === "absent") return { ok: false, reason: "Aucun noyau : démarre-le d'abord" };
+    if (!this.term || !this.subscribed || this.status === "absent") return { ok: false, reason: "Aucun noyau : démarre-le d'abord" };
     if (this.status === "dead") return { ok: false, reason: "Le noyau est arrêté : redémarre-le" };
     const src = source();
     if ("reason" in src) return { ok: false, reason: src.reason };
@@ -154,7 +199,7 @@ export abstract class ExecRunner extends KernelSession {
       return { ok: false, reason: e?.message ?? "Requête refusée" };
     }
     // The state of a run is registered before anything goes out: its first events can't be missed.
-    this.execs.set(execId, { slot, st: newWriteState(), queue: [] });
+    this.execs.set(execId, { slot, st: newWriteState(), queue: [], last: Date.now() });
     const begun = begin(execId);
     if (!begun.ok) {
       this.execs.delete(execId);
@@ -169,21 +214,38 @@ export abstract class ExecRunner extends KernelSession {
   /** The kernel session ended (terminal exited or removed): this client's runs end with an error. */
   terminalGone() {
     if (this.status !== "dead") {
-      this.status = "dead";
+      this.setStatus("dead");
       this.emit();
     }
-    for (const [id, ex] of [...this.execs]) {
-      const evs: KernelEvent[] = [
-        { ev: "error", id, ename: "KernelStopped", evalue: "le noyau s'est arrêté", traceback: [] },
-        { ev: "done", id, count: null, status: "error" },
-      ];
-      try {
-        this.applyEvents(ex.slot, id, evs, ex.st);
-      } catch (e) {
-        console.error("[excalibash]", e);
-      }
-      this.forget(id);
+    this.abandonRuns("le noyau s'est arrêté");
+  }
+
+  /** Following another kernel session (or none): this client's runs on the old one end with an error. */
+  protected leaveSession() {
+    this.abandonRuns("le noyau a été arrêté ou remplacé");
+  }
+
+  /** Ends this client's runs with an error (what was queued is written first). */
+  private abandonRuns(evalue: string) {
+    for (const id of [...this.execs.keys()]) this.endRun(id, "KernelStopped", evalue);
+  }
+
+  private endRun(id: string, ename: string, evalue: string) {
+    const ex = this.execs.get(id);
+    if (!ex) return;
+    if (ex.timer) clearTimeout(ex.timer);
+    ex.timer = undefined;
+    // A `done` already received but not yet written ends the run normally.
+    const evs: KernelEvent[] = ex.queue.some((e) => e.ev === "done")
+      ? ex.queue
+      : [...ex.queue, { ev: "error", id, ename, evalue, traceback: [] }, { ev: "done", id, count: null, status: "error" }];
+    ex.queue = [];
+    try {
+      this.applyEvents(ex.slot, id, evs, ex.st);
+    } catch (e) {
+      console.error("[excalibash]", e);
     }
+    this.forget(id);
   }
 
   // ---- everybody: finalize the runs whose executor is gone ----------------------------------------------------------
@@ -211,6 +273,13 @@ export abstract class ExecRunner extends KernelSession {
       }
     }
     for (const id of [...this.orphanSince.keys()]) if (!live.has(id)) this.orphanSince.delete(id);
+    // Own runs whose request was lost (socket down, terminal not running yet): the kernel has been idle for a
+    // while and nothing ever came back for them.
+    if ((this.status === "idle" || this.status === "dead") && now - this.statusSince >= LOST_MS) {
+      for (const [id, ex] of [...this.execs]) {
+        if (now - ex.last >= LOST_MS && !ex.queue.length) this.endRun(id, "ExecutionLost", "aucune réponse du noyau pour cette exécution : la requête a dû se perdre, relance-la");
+      }
+    }
   }
 
   destroy() {

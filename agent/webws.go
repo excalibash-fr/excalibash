@@ -115,11 +115,11 @@ func (w *webHub) abort(s *wsSock) {
 
 // wsOpen handles a sealed open request; it runs in its own goroutine.
 func (w *webHub) wsOpen(msg message, out *outbox) {
-	ts, err := strconv.ParseInt(string(msg.Ts), 10, 64)
-	if err != nil || !validSid.MatchString(msg.Sid) {
+	ts, ok := parseTs(msg.Ts)
+	if !ok || !validSid.MatchString(msg.Sid) {
 		return
 	}
-	if skew := time.Since(time.UnixMilli(ts)); skew > inputMaxSkew || skew < -inputMaxSkew {
+	if !tsInWindow(ts) {
 		debugf("ws %s: timestamp out of window", msg.ID)
 		return
 	}
@@ -129,21 +129,10 @@ func (w *webHub) wsOpen(msg message, out *outbox) {
 	}
 
 	nonce := "ws/" + msg.ID + "/" + msg.Sid
-	now := time.Now()
 	w.mu.Lock()
 	t := w.tunnels[msg.ID]
-	// Amortised expiry: a full scan at most once per noncePruneEvery.
-	if now.Sub(w.lastPrune) > noncePruneEvery {
-		w.lastPrune = now
-		for n, at := range w.nonces {
-			if now.Sub(at) > nonceLifetime {
-				delete(w.nonces, n)
-			}
-		}
-	}
-	_, replayed := w.nonces[nonce]
 	w.mu.Unlock()
-	if t == nil || replayed {
+	if t == nil || w.nonces.seen(nonce) {
 		return
 	}
 	pt, err := unbox(t.key, data, "eb:ws-open:"+msg.ID+":"+msg.Sid+":"+strconv.FormatInt(ts, 10))
@@ -152,13 +141,7 @@ func (w *webHub) wsOpen(msg message, out *outbox) {
 		return
 	}
 	// Authoritative anti-replay, once the frame is authenticated (a forged frame must not burn a nonce).
-	w.mu.Lock()
-	_, replayed = w.nonces[nonce]
-	if !replayed {
-		w.nonces[nonce] = now
-	}
-	w.mu.Unlock()
-	if replayed {
+	if !w.nonces.claim(nonce) {
 		return
 	}
 

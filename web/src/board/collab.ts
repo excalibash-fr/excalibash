@@ -2,7 +2,7 @@ import { CaptureUpdateAction, reconcileElements, restoreElements } from "@excali
 import type { ExcalidrawImperativeAPI, Collaborator, SocketId, BinaryFiles, AppState } from "@excalidraw/excalidraw/types";
 import type { OrderedExcalidrawElement } from "@excalidraw/excalidraw/element/types";
 import type { Entry, RemoteTarget, Role, TerminalInfo, WebInfo, WebTarget } from "../api.ts";
-import { AAD, box, boxJson, boxText, newSymKey, randomId, toB64, unbox, unboxJson, unboxText, unwrapKey, utf8, wrapKey, type SymKey } from "../crypto.ts";
+import { AAD, box, boxJson, boxText, newSymKey, randomId, randomTunnelId, toB64, unbox, unboxJson, unboxText, unwrapKey, utf8, wrapKey, type SymKey } from "../crypto.ts";
 import { discardDocs, docIds } from "./docGc.ts";
 import { decryptEntry, decryptFile, decryptPointer, encryptEntry, encryptFile, encryptPointer } from "./boardCrypto.ts";
 
@@ -155,6 +155,25 @@ export class BoardSession {
   /** Asks the server to delete a shared document for good (editors only; subscribers get `doc.gone`). */
   docDelete(doc: string): boolean {
     return this.canEdit && this.send({ t: "doc.del", doc, epoch: this.epoch });
+  }
+
+  /**
+   * True while a live element refers to the document: a node listing it (copies of a node share
+   * its docIds) or its window. Without a scene we cannot tell, so it counts as referenced.
+   */
+  docReferenced(doc: string): boolean {
+    const api = this.api;
+    if (!api || this.disposed) return true;
+    for (const e of api.getSceneElementsIncludingDeleted()) {
+      if (e.isDeleted) continue;
+      const data = e.customData as Record<string, any> | undefined;
+      if (!data) continue;
+      if (data.codeId === doc || data.notebookId === doc) return true;
+      for (const list of [data.codes, data.notebooks]) {
+        if (Array.isArray(list) && list.some((r) => r && typeof r === "object" && r.docId === doc)) return true;
+      }
+    }
+    return false;
   }
 
   /** Routes the doc.* messages of `doc` to `handler`; it is told right away if the socket is already up. */
@@ -494,7 +513,8 @@ export class BoardSession {
         if (data?.node) {
           for (const sh of data.shells ?? []) this.closeTerminal(sh.terminalId);
           for (const w of data.webs ?? []) this.closeWeb(w.webId);
-          // Its code and notebook documents go with it (and the kernels of its notebooks).
+          // Its code and notebook documents go with it (and the kernels of its notebooks), after a
+          // grace period and only if no copy of the node or undo brought a reference back.
           void discardDocs(this, [...docIds(data.codes, false), ...docIds(data.notebooks, true)]);
         }
       }
@@ -626,7 +646,7 @@ export class BoardSession {
    * owner-only machine auth key, so neither the server nor anyone else can redirect it.
    */
   async createWeb(machine: { id: string; name: string; auth: SymKey }, target: Omit<WebTarget, "machine">): Promise<WebInfo> {
-    const id = randomId();
+    const id = randomTunnelId();
     const kw = await newSymKey();
     const full: WebTarget = { ...target, machine: machine.name };
     const frame = {

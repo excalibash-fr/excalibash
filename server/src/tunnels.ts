@@ -2,6 +2,8 @@ import { db } from "./db.ts";
 import { agentHooks, isMachineOnline, sendAgent } from "./terminals.ts";
 import type { WebSocket } from "ws";
 import { broadcastToBoard } from "./hub.ts";
+import { isRid } from "./validate.ts";
+import { dropTunnelSessions, onSessionsDropped } from "./tunnelSessions.ts";
 
 // Web tunnels relay end-to-end encrypted HTTP between a viewer's browser (service worker on the
 // proxy origin) and an agent. The server never sees requests or responses: it only forwards
@@ -54,6 +56,11 @@ export function tunnelExists(id: string): boolean {
   return tunnels.has(id);
 }
 
+/** Board a tunnel belongs to (access to the tunnel follows access to that board). */
+export function tunnelBoard(id: string): string | undefined {
+  return tunnels.get(id)?.boardId;
+}
+
 export function createTunnel(t: Tunnel): TunnelInfo {
   db.prepare(
     "INSERT INTO tunnels (id, board_id, machine_id, created_by, key_for_board, key_for_agent, enc_label, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -77,6 +84,7 @@ export function dropTunnels(ids: Iterable<string>): void {
     if (!t) continue;
     sendAgent(t.machineId, { t: "web.close", id });
     closeLinks((l) => l.tunnelId === id, 1001);
+    dropTunnelSessions(id);
     tunnels.delete(id);
     db.prepare("DELETE FROM tunnels WHERE id = ?").run(id);
     broadcastToBoard(t.boardId, { t: "web.gone", id });
@@ -101,6 +109,7 @@ export function rekeyTunnel(id: string, keyForBoard: string, keyForAgent: string
   const t = tunnels.get(id);
   if (!t) return;
   closeLinks((l) => l.tunnelId === id, 1001); // sockets opened with the old key are cut
+  dropTunnelSessions(id); // viewers go through the ticket handshake again
   Object.assign(t, { keyForBoard, keyForAgent, encLabel });
   db.prepare("UPDATE tunnels SET key_for_board = ?, key_for_agent = ?, enc_label = ? WHERE id = ?").run(keyForBoard, keyForAgent, encLabel, id);
   openOnAgent(t);
@@ -156,7 +165,6 @@ type Link = { tunnelId: string; sid: string; machineId: string; ws: WebSocket };
 const links = new Map<string, Link>(); // `${tunnelId}/${sid}`
 const MAX_LINKS_PER_TUNNEL = 64;
 const MAX_BUFFERED = 32 * 1024 * 1024;
-const SID = /^[A-Za-z0-9_-]{16,64}$/;
 
 function closeLinks(match: (l: Link) => boolean, code: number): void {
   for (const [k, l] of links) {
@@ -166,9 +174,23 @@ function closeLinks(match: (l: Link) => boolean, code: number): void {
   }
 }
 
+// Sockets opened with a tunnel session (subdomain mode): cut when that session ends.
+const socketSessions = new Map<WebSocket, string>();
+
+onSessionsDropped((keys) => {
+  for (const [ws, k] of socketSessions) if (keys.has(k)) ws.close(1008);
+});
+
+/** Keys of the tunnel sessions that have an open socket. */
+export const socketSessionKeys = (): Set<string> => new Set(socketSessions.values());
+
 /** Speaks the browser side of a tunnelled WebSocket (shim on the proxy origin). */
-export function attachTunnelSocket(ws: WebSocket, tunnelId: string): void {
+export function attachTunnelSocket(ws: WebSocket, tunnelId: string, sessionKey?: string): void {
   let link: Link | undefined;
+  if (sessionKey) {
+    socketSessions.set(ws, sessionKey);
+    ws.on("close", () => socketSessions.delete(ws));
+  }
   const fail = (code: number) => ws.close(code);
 
   ws.on("message", (raw, isBinary) => {
@@ -182,7 +204,7 @@ export function attachTunnelSocket(ws: WebSocket, tunnelId: string): void {
     const t = tunnels.get(tunnelId);
     if (!t) return fail(1001);
     if (!link) {
-      if (msg?.t !== "open" || typeof msg.sid !== "string" || !SID.test(msg.sid) || !Number.isSafeInteger(msg.ts) || typeof msg.d !== "string") return fail(1008);
+      if (msg?.t !== "open" || !isRid(msg.sid) || !Number.isSafeInteger(msg.ts) || typeof msg.d !== "string") return fail(1008);
       const key = `${tunnelId}/${msg.sid}`;
       let n = 0;
       for (const l of links.values()) if (l.tunnelId === tunnelId) n++;

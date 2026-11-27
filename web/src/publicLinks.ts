@@ -3,7 +3,7 @@
 // the board key wrapped under K_l, so a holder of the whole URL can decrypt the board (and only that).
 import { api, type Entry } from "./api.ts";
 import { decryptEntry, decryptFile } from "./board/boardCrypto.ts";
-import { AAD, box, boxText, fromB64, newSymKey, randomBytes, symKey, toB64, unboxText, unwrapKey, type SymKey } from "./crypto.ts";
+import { AAD, box, boxText, fromB64, hex, newSymKey, randomBytes, symKey, toB64, unboxText, unwrapKey, type SymKey } from "./crypto.ts";
 
 export type LinkInfo = { publicId: string; encLabel: string | null; createdAt: number; expiresAt: number | null; epoch: number; createdBy: string | null };
 export type LinkView = Omit<LinkInfo, "encLabel"> & { label: string };
@@ -19,7 +19,7 @@ export const LINK_LIFETIMES: { days: number | null; label: string }[] = [
 /** Creates a link for a board and returns its full URL (the only time the token is known). */
 export async function createPublicLink(board: { id: string; key: SymKey; epoch: number; name: string }, label: string, days: number | null): Promise<string> {
   const linkKey = await newSymKey();
-  const publicId = [...randomBytes(8)].map((b) => b.toString(16).padStart(2, "0")).join("");
+  const publicId = hex(randomBytes(8));
   const body = {
     publicId,
     epoch: board.epoch,

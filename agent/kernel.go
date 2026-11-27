@@ -4,8 +4,10 @@ import (
 	_ "embed"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os/exec"
+	"reflect"
 	"regexp"
 	"strings"
 	"sync"
@@ -29,7 +31,21 @@ const (
 	kernelStderrCap = 64 << 10 // total bridge stderr forwarded as log lines
 	kernelStopGrace = 3 * time.Second
 	maxCwdLen       = 512
+	maxKernels      = 8 // concurrent Jupyter sessions per agent
 )
+
+// kernelSlots caps the number of bridges (each with its kernel) running at once: a kernel holds
+// a whole interpreter, so a burst of sessions from a compromised board cannot exhaust the machine.
+var kernelSlots = make(chan struct{}, maxKernels)
+
+// setParentDeathSignal asks the kernel (Linux, FreeBSD) to SIGKILL the bridge when the agent
+// dies, so a crashed or SIGKILLed agent leaves no bridge (and, through the bridge, no kernel)
+// behind. The field only exists on some systems, hence reflection rather than build tags.
+func setParentDeathSignal(attr *syscall.SysProcAttr) {
+	if f := reflect.ValueOf(attr).Elem().FieldByName("Pdeathsig"); f.IsValid() && f.CanSet() {
+		f.Set(reflect.ValueOf(syscall.SIGKILL).Convert(f.Type()))
+	}
+}
 
 var kernelName = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
 
@@ -147,6 +163,13 @@ func (w muxWriter) Write(p []byte) (int, error) { w.m.log(string(p)); return len
 
 func (r *remote) runJupyter() int {
 	mux := &lineMux{w: r.outW}
+	select {
+	case kernelSlots <- struct{}{}:
+		defer func() { <-kernelSlots }()
+	default:
+		kernelEvent(r.outW, map[string]any{"ev": "fatal", "error": fmt.Sprintf("trop de noyaux Jupyter ouverts sur cette machine (%d au maximum) : fermez-en un", maxKernels)})
+		return 1
+	}
 	py, err := findPython()
 	if err != nil {
 		kernelEvent(r.outW, map[string]any{"ev": "fatal", "error": err.Error() + " : installez Python 3 avec ipykernel et jupyter_client"})
@@ -156,6 +179,7 @@ func (r *remote) runJupyter() int {
 	cmd.Dir = pickCwd()
 	cmd.Env = shellEnv()
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	setParentDeathSignal(cmd.SysProcAttr)
 	// Cancellation: ask the bridge to stop (it shuts the kernel down), then Go kills it.
 	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM) }
 	cmd.WaitDelay = kernelStopGrace

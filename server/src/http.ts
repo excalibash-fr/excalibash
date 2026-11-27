@@ -1,7 +1,9 @@
+import { isIPv6 } from "node:net";
 import type { Request } from "express";
 import { config } from "./config.ts";
 import { knownHostnames } from "./tls.ts";
 import type { MailLink } from "./mailTemplate.ts";
+import { isB64Url } from "./validate.ts";
 
 export class HttpError extends Error {
   status: number;
@@ -15,7 +17,7 @@ export const str = (v: unknown, max = 200): string => (typeof v === "string" ? v
 
 /** Opaque client-produced blob (ciphertext, key, wrapped key): must be a non-empty base64url string. */
 export function blob(v: unknown, max = 8192): string {
-  if (typeof v !== "string" || !v || v.length > max || !/^[A-Za-z0-9_-]+$/.test(v)) throw new HttpError(400, "Données chiffrées invalides");
+  if (!isB64Url(v, max)) throw new HttpError(400, "Données chiffrées invalides");
   return v;
 }
 
@@ -44,3 +46,15 @@ export function mailLink(req: Request, path: string, label: string): MailLink | 
   }
   return undefined;
 }
+
+/** "2001:db8:1:2:a:b:c:d" → "2001:db8:1:2::" (still an address, for ipPrefix and the logs). */
+function ipv6Net64(ip: string): string {
+  const [head, tail = ""] = ip.split("%")[0]!.split("::");
+  const h = head ? head.split(":") : [];
+  const t = tail ? tail.split(":") : [];
+  const groups = ip.includes("::") ? [...h, ...Array(Math.max(0, 8 - h.length - t.length)).fill("0"), ...t] : h;
+  return groups.slice(0, 4).join(":") + "::";
+}
+
+/** The address rate limits count: IPv6 clients are grouped by /64 (one subscriber usually holds a whole one). */
+export const clientNet = (ip: string): string => (isIPv6(ip) && !/^::ffff:/i.test(ip) ? ipv6Net64(ip) : ip);

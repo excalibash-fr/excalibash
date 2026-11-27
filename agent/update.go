@@ -200,32 +200,6 @@ func checkUpgrade(current, candidate string, allowDev bool) error {
 	return nil
 }
 
-// replayGuard remembers request ids for a while, against replays.
-type replayGuard struct {
-	mu   sync.Mutex
-	seen map[string]time.Time
-}
-
-// fresh records an id, and reports false when it was already seen.
-func (g *replayGuard) fresh(id string) bool {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	if g.seen == nil {
-		g.seen = map[string]time.Time{}
-	}
-	now := time.Now()
-	for n, at := range g.seen {
-		if now.Sub(at) > nonceLifetime {
-			delete(g.seen, n)
-		}
-	}
-	if _, dup := g.seen[id]; dup {
-		return false
-	}
-	g.seen[id] = now
-	return true
-}
-
 // swapState lets a swapped executable be put back.
 type swapState struct{ exe, old string }
 
@@ -240,7 +214,7 @@ type updater struct {
 	allowDev bool
 	base     string // http(s)://host[/prefix] of the server, set once the endpoint is known
 	client   *http.Client
-	replay   replayGuard
+	replay   *nonceSet
 
 	exePath    func() (string, error)
 	platform   string
@@ -256,7 +230,7 @@ type updater struct {
 func newUpdater(auth []byte) *updater {
 	key, err := parseUpdateKey(updatePubKey)
 	return &updater{
-		auth: auth, key: key, keyErr: err, current: version,
+		auth: auth, key: key, keyErr: err, current: version, replay: newNonceSet(maxUpdateNonces),
 		allowDev: os.Getenv(envAllowDev) == "1",
 		client:   &http.Client{},
 		exePath:  realExecutable,
@@ -360,11 +334,11 @@ func (r *reporter) send(phase, text string, end bool, extra map[string]any) {
 // handle answers one update request: box(auth, {op:"update"}, "eb:update:<rid>:<ts>") in,
 // progress frames boxed under "eb:update-res:<rid>" out. Runs in its own goroutine.
 func (u *updater) handle(msg message, out *outbox) {
-	ts, err := strconv.ParseInt(string(msg.Ts), 10, 64)
-	if err != nil || msg.Rid == "" || len(msg.Rid) > 64 {
+	ts, ok := parseTs(msg.Ts)
+	if !ok || msg.Rid == "" || len(msg.Rid) > 64 {
 		return
 	}
-	if skew := time.Since(time.UnixMilli(ts)); skew > inputMaxSkew || skew < -inputMaxSkew {
+	if !tsInWindow(ts) {
 		debugf("update %s: timestamp out of window", msg.Rid)
 		return
 	}
@@ -377,7 +351,7 @@ func (u *updater) handle(msg message, out *outbox) {
 		debugf("update %s: authentication failed", msg.Rid)
 		return
 	}
-	if !u.replay.fresh(msg.Rid) {
+	if !u.replay.claim(msg.Rid) {
 		return
 	}
 	var req struct {

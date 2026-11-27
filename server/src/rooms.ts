@@ -16,6 +16,7 @@ import {
 import { fileRequest } from "./files.ts";
 import { HistoryTracker } from "./history.ts";
 import {
+  COMPACT_UPDATES,
   MAX_AWARENESS,
   MAX_FRAME,
   MAX_SNAPSHOT,
@@ -23,9 +24,10 @@ import {
   applySnapshot,
   deleteDoc,
   docState,
-  isB64,
+  isDeletedDoc,
   isDocId,
 } from "./docs.ts";
+import { isB64Url, isTunnelId } from "./validate.ts";
 import { closeTunnel, createTunnel, listBoardTunnels, tunnelExists } from "./tunnels.ts";
 
 /** Encrypted element: only the merge metadata is readable by the server. */
@@ -46,6 +48,10 @@ type Client = {
   msgAt: number;
   /** Set once the socket is being closed (rights changed, keys rotated): its messages are ignored. */
   gone?: boolean;
+  /** Rate limit of every doc.* message (token bucket), and a stricter one for doc.sub (each one reads the whole document). */
+  docTokens: number;
+  subTokens: number;
+  docAt: number;
 };
 
 const AWARENESS_RATE = 10; // messages per second per socket
@@ -60,6 +66,11 @@ const MAX_FILES = 2000;
 // Stays well below V8's longest string (~512 MiB): flush() serializes them all in one JSON string.
 const MAX_FILES_BYTES = 256 * 1024 * 1024;
 const MAX_SUBSCRIPTIONS = 64;
+const DOC_RATE = 200; // doc.* messages per second per socket (several documents typed into at once)
+const DOC_BURST = 400;
+// A fresh socket may open many documents at once, then a few per second.
+const SUB_RATE = 8; // doc.sub per second once the burst is spent (each one reads the document from the database)
+const SUB_BURST = 4 * MAX_SUBSCRIPTIONS; // opening every window of a board at once, several times
 const COMPACT_RETRY = 5000;
 
 const SAVE_DELAY = 1500;
@@ -128,7 +139,7 @@ class Room implements BoardRoom {
   }
 
   join(ws: WebSocket, user: User, role: Role, session?: string): void {
-    const client: Client = { id: newId(6), user, role, session, docs: new Set(), awTokens: AWARENESS_RATE, awAt: Date.now(), msgTokens: MESSAGE_BURST, msgAt: Date.now() };
+    const client: Client = { id: newId(6), user, role, session, docs: new Set(), awTokens: AWARENESS_RATE, awAt: Date.now(), msgTokens: MESSAGE_BURST, msgAt: Date.now(), docTokens: DOC_BURST, subTokens: SUB_BURST, docAt: Date.now() };
     this.clients.set(ws, client);
     ws.send(
       JSON.stringify({
@@ -276,7 +287,7 @@ class Room implements BoardRoom {
         if (!editor) return deny("Lecture seule");
         const machine = getMachine(String(msg.machineId));
         if (!machine || !machineAccess(client.user.id, machine, this.boardId)) return deny("Cette machine ne t'est pas partagée");
-        if (!isClientId(msg.id) || tunnelExists(msg.id)) return deny("Identifiant de tunnel invalide");
+        if (!isTunnelId(msg.id) || tunnelExists(msg.id)) return deny("Identifiant de tunnel invalide");
         if (!str(msg.keyForBoard) || !str(msg.keyForAgent) || !str(msg.encLabel)) return deny("Clés manquantes");
         const web = createTunnel({
           id: msg.id,
@@ -339,9 +350,27 @@ class Room implements BoardRoom {
     }
   }
 
+  /** Asks this socket (an editor that has the document loaded) to compact it, at most every COMPACT_RETRY. */
+  private askCompact(ws: WebSocket, doc: string): void {
+    const now = Date.now();
+    if (now - (this.compactAsked.get(doc) ?? 0) <= COMPACT_RETRY) return;
+    this.compactAsked.set(doc, now);
+    ws.send(JSON.stringify({ t: "doc.compact", doc }));
+  }
+
   private onDoc(ws: WebSocket, client: Client, msg: any, editor: boolean): void {
     const doc = msg.doc;
     const fail = (error: string) => ws.send(JSON.stringify({ t: "doc.err", doc: typeof doc === "string" ? doc.slice(0, 64) : "", error }));
+    // Leaving is never limited (it only lowers the load); everything else draws from the bucket.
+    if (msg.t !== "doc.unsub") {
+      const now = Date.now();
+      const dt = (now - client.docAt) / 1000;
+      client.docAt = now;
+      client.docTokens = Math.min(DOC_BURST, client.docTokens + dt * DOC_RATE);
+      client.subTokens = Math.min(SUB_BURST, client.subTokens + dt * SUB_RATE);
+      if (client.docTokens < 1) return msg.t === "doc.aw" ? undefined : fail("trop de requêtes");
+      client.docTokens--;
+    }
     if (!isDocId(doc)) return fail("identifiant de document invalide");
     const relay = (data: object) => {
       const text = JSON.stringify(data);
@@ -350,15 +379,22 @@ class Room implements BoardRoom {
 
     switch (msg.t) {
       case "doc.sub": {
-        if (!client.docs.has(doc)) {
-          if (client.docs.size >= MAX_SUBSCRIPTIONS) return fail("trop de documents ouverts");
-          client.docs.add(doc);
-          let subs = this.docSubs.get(doc);
-          if (!subs) this.docSubs.set(doc, (subs = new Set()));
-          subs.add(ws);
-        }
+        // Clients subscribe once per socket: a repeat would only re-read and re-send the whole document.
+        if (client.docs.has(doc)) return fail("document déjà ouvert");
+        if (client.docs.size >= MAX_SUBSCRIPTIONS) return fail("trop de documents ouverts");
+        if (client.subTokens < 1) return fail("trop de requêtes");
+        client.subTokens--;
+        // Deleted for good: a client that was offline must not bring it back from its local copy.
+        if (isDeletedDoc(this.boardId, doc)) return ws.send(JSON.stringify({ t: "doc.gone", doc }));
+        client.docs.add(doc);
+        let subs = this.docSubs.get(doc);
+        if (!subs) this.docSubs.set(doc, (subs = new Set()));
+        subs.add(ws);
         // Same tick as the subscription: no update can slip between the state and the live relay.
-        ws.send(JSON.stringify({ t: "doc.state", doc, ...docState(this.boardId, doc) }));
+        const state = docState(this.boardId, doc);
+        ws.send(JSON.stringify({ t: "doc.state", doc, ...state }));
+        // Left uncompacted (its last writer went away): the first editor to load it compacts it.
+        if (editor && state.ups.length > COMPACT_UPDATES) this.askCompact(ws, doc);
         break;
       }
       case "doc.unsub":
@@ -368,23 +404,28 @@ class Room implements BoardRoom {
         if (!editor) return fail("Lecture seule");
         if (msg.epoch !== this.epoch) return ws.send(JSON.stringify({ t: "rekey" }));
         if (!client.docs.has(doc)) return fail("document non ouvert");
-        if (!isB64(msg.d, MAX_FRAME)) return fail("mise à jour invalide");
+        if (!isB64Url(msg.d, MAX_FRAME)) return fail("mise à jour invalide");
         const r = appendUpdate(this.boardId, doc, this.epoch, msg.d);
-        if (!r.ok) return fail(r.error);
+        if (!r.ok) {
+          if (r.gone) {
+            this.unsubscribe(ws, client, doc);
+            return ws.send(JSON.stringify({ t: "doc.gone", doc }));
+          }
+          fail(r.error);
+          // Full: a compaction (history folded into one snapshot) usually frees most of the room.
+          if (r.tooBig) this.askCompact(ws, doc);
+          return;
+        }
         relay({ t: "doc.up", doc, d: msg.d, seq: r.seq });
         ws.send(JSON.stringify({ t: "doc.ack", doc, seq: r.seq }));
-        const now = Date.now();
-        if (r.compact && now - (this.compactAsked.get(doc) ?? 0) > COMPACT_RETRY) {
-          // The writer is an editor that has the document loaded: it is the one asked to compact.
-          this.compactAsked.set(doc, now);
-          ws.send(JSON.stringify({ t: "doc.compact", doc }));
-        }
+        // The writer is an editor that has the document loaded: it is the one asked to compact.
+        if (r.compact) this.askCompact(ws, doc);
         break;
       }
       case "doc.snap": {
         if (!editor) return fail("Lecture seule");
         if (msg.epoch !== this.epoch) return ws.send(JSON.stringify({ t: "rekey" }));
-        if (!isB64(msg.d, MAX_SNAPSHOT)) return fail("instantané invalide");
+        if (!isB64Url(msg.d, MAX_SNAPSHOT)) return fail("instantané invalide");
         const r = applySnapshot(this.boardId, doc, msg.d, msg.upto);
         if (!r.ok) return fail(r.error);
         this.compactAsked.delete(doc);
@@ -410,14 +451,16 @@ class Room implements BoardRoom {
         break;
       }
       case "doc.aw": {
-        if (!client.docs.has(doc) || !isB64(msg.d, MAX_AWARENESS)) return;
+        // Viewers publish their presence too, but their frames are flagged `ro`: awareness also carries
+        // state others act on (running notebook cells), which a viewer, holding the board key, could forge.
+        if (!client.docs.has(doc) || !isB64Url(msg.d, MAX_AWARENESS)) return;
         // Relayed only, never stored; at most AWARENESS_RATE messages per second per socket.
         const now = Date.now();
         client.awTokens = Math.min(AWARENESS_RATE, client.awTokens + ((now - client.awAt) / 1000) * AWARENESS_RATE);
         client.awAt = now;
         if (client.awTokens < 1) return;
         client.awTokens--;
-        relay({ t: "doc.aw", doc, d: msg.d, from: client.id });
+        relay({ t: "doc.aw", doc, d: msg.d, from: client.id, ...(editor ? {} : { ro: true }) });
         break;
       }
     }

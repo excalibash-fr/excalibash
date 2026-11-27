@@ -28,10 +28,10 @@ import { emailEnabled, sendVerificationCode, verificationRequired } from "../mai
 import { notify } from "../notify.ts";
 import { createChallenge, verifyPow } from "../pow.ts";
 import { kickUser } from "../rooms.ts";
+import { dropUserTunnelSessions } from "../tunnelSessions.ts";
+import { isEmail } from "../validate.ts";
 
 export const authApi = Router();
-
-const EMAIL = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;
 
 // First account: whoever registers first becomes admin, so a fresh instance asks for a code
 // printed in the server log. A stranger who finds the instance before its owner can't take it.
@@ -136,7 +136,7 @@ authApi.post("/register", async (req, res) => {
   if (!rateLimit("reg:global", config.registrationsPerHour, 3600_000)) throw new HttpError(429, "Trop d'inscriptions en ce moment, réessaie plus tard");
   const email = str(b.email);
   const name = str(b.name, 60);
-  if (!EMAIL.test(email)) throw new HttpError(400, "Email invalide");
+  if (!isEmail(email)) throw new HttpError(400, "Email invalide");
   if (!name) throw new HttpError(400, "Nom requis");
   if (!isClientId(b.id)) throw new HttpError(400, "Identifiant invalide");
   // Hashed first (off the main thread): from the checks to the insert, nothing awaits, so two
@@ -280,6 +280,7 @@ authApi.post("/recover/finish", async (req, res) => {
     row.id,
   );
   db.prepare("DELETE FROM sessions WHERE user_id = ?").run(row.id);
+  dropUserTunnelSessions(row.id);
   // Live boards opened with the old sessions are cut too (the client reconnects if it still can).
   kickUser(row.id, 4001, "session terminée");
   createSession(req, res, row.id);
@@ -329,6 +330,7 @@ authApi.post("/password", (req, res) => {
   );
   // Every other device must log in again with the new password.
   db.prepare("DELETE FROM sessions WHERE user_id = ? AND token_hash != ?").run(row.id, currentSessionHash(req) ?? "");
+  dropUserTunnelSessions(row.id, currentSessionHash(req) ?? "");
   kickUser(row.id, 4001, "session terminée");
   res.json({ ok: true });
 });
