@@ -264,8 +264,7 @@ export function newId(bytes = 12): string {
   return randomBytes(bytes).toString("base64url");
 }
 
-/** Client-generated ids (bound into ciphertext AADs). */
-export const isClientId = (v: unknown): v is string => typeof v === "string" && /^[A-Za-z0-9_-]{16,43}$/.test(v);
+export { isClientId } from "./validate.ts";
 
 export function getSetting(key: string, fallback: string): string {
   const row = db.prepare("SELECT value FROM settings WHERE key = ?").get(key) as { value: string } | undefined;

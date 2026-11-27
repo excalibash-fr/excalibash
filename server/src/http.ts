@@ -2,6 +2,7 @@ import type { Request } from "express";
 import { config } from "./config.ts";
 import { knownHostnames } from "./tls.ts";
 import type { MailLink } from "./mailTemplate.ts";
+import { isB64Url } from "./validate.ts";
 
 export class HttpError extends Error {
   status: number;
@@ -15,7 +16,7 @@ export const str = (v: unknown, max = 200): string => (typeof v === "string" ? v
 
 /** Opaque client-produced blob (ciphertext, key, wrapped key): must be a non-empty base64url string. */
 export function blob(v: unknown, max = 8192): string {
-  if (typeof v !== "string" || !v || v.length > max || !/^[A-Za-z0-9_-]+$/.test(v)) throw new HttpError(400, "Données chiffrées invalides");
+  if (!isB64Url(v, max)) throw new HttpError(400, "Données chiffrées invalides");
   return v;
 }
 

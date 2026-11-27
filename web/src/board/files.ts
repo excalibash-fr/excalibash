@@ -3,6 +3,7 @@ import type { SymKey } from "../crypto.ts";
 import { createItem, fetchBoardContent } from "../library.tsx";
 import { encryptPreview } from "./boardCrypto.ts";
 import { isWindow } from "./nodes.ts";
+import { saveBlob } from "../download.ts";
 
 /** Renders a scene to an SVG string for dashboard thumbnails (Excalidraw is loaded on demand). */
 export async function renderPreview(elements: readonly any[], files: Record<string, any>, background = "#ffffff"): Promise<string | null> {
@@ -56,11 +57,7 @@ export async function exportBoard(name: string, key: SymKey, id: string) {
     files: content.files,
   };
   const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
-  const a = document.createElement("a");
-  a.href = URL.createObjectURL(blob);
-  a.download = `${name.replace(/[\\/:*?"<>|]+/g, "_") || "tableau"}.excalidraw`;
-  a.click();
-  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  saveBlob(blob, `${name.replace(/[\\/:*?"<>|]+/g, "_") || "tableau"}.excalidraw`);
 }
 
 /** Imports .excalidraw / .json files as new encrypted boards. Returns how many were created. */

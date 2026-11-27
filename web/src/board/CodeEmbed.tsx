@@ -34,6 +34,7 @@ import { kernelCwd } from "./notebookDoc.ts";
 import { classifyOutputs } from "./notebookRender.ts";
 import { Outputs } from "./OutputView.tsx";
 import { bindPythonKernel } from "./pyKernel.ts";
+import { saveBlob } from "../download.ts";
 
 /** What the window needs from the app's UI kit, handed in by the board page (this chunk must not import it: see BoardPage). */
 export type CodeHost = {
@@ -447,11 +448,7 @@ export default function CodeEmbed({ host, session, docId, nodeId, active, shells
 
   const download = () => {
     if (!doc) return;
-    const a = document.createElement("a");
-    a.href = URL.createObjectURL(new Blob([text()], { type: "text/plain;charset=utf-8" }));
-    a.download = meta.name;
-    a.click();
-    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+    saveBlob(new Blob([text()], { type: "text/plain;charset=utf-8" }), meta.name);
   };
 
   const cmd = meta.path ? runCommand(meta.path, meta.language) : runCommand(meta.name, meta.language);

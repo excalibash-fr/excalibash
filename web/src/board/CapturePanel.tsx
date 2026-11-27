@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { AgentOutdatedNotice } from "../components/AgentOutdated.tsx";
-import { FileClient, IFACE_RE, filterProblem, type MachineIface } from "./fileTransfer.ts";
+import { FileClient, filterProblem, type MachineIface } from "./fileTransfer.ts";
+import { IFACE_RE } from "../validators.ts";
+import { fmtBytes } from "../format.ts";
 import { splitDetails } from "./errorDetails.ts";
 import { exportName } from "./termTools.ts";
 import type { CaptureManager } from "./captureManager.ts";
@@ -96,7 +98,7 @@ export function CapturePanel({ client, manager, captureKey, cableIface }: { clie
           )}
           {entry?.phase === "done" && (
             <div className="field-help" role="status" data-testid="capture-done">
-              Capture sur {entry.iface} terminée : {(entry.bytes / 1024).toFixed(0)} Kio, téléchargés dans {entry.file}.
+              Capture sur {entry.iface} terminée : {fmtBytes(entry.bytes)}, téléchargés dans {entry.file}.
             </div>
           )}
           {names ? (
@@ -152,7 +154,7 @@ export function CapturePanel({ client, manager, captureKey, cableIface }: { clie
       ) : (
         <div className="capture-row" data-testid="capture-running">
           <span>
-            Capture sur {entry.iface} : {(entry.bytes / 1024).toFixed(1)} Kio capturés…
+            Capture sur {entry.iface} : {fmtBytes(entry.bytes)} capturés…
           </span>
           <button type="button" className="btn" disabled={entry.stopping} onClick={() => manager.stop(captureKey)}>
             Arrêter
@@ -181,7 +183,7 @@ export function CaptureDock({ manager }: { manager: CaptureManager }) {
           <div key={e.key} className="capture-chip" data-testid="capture-chip">
             <span className="dot on" />
             <span>
-              Capture {e.iface} · {e.bytes < 1024 ? `${e.bytes} o` : `${(e.bytes / 1024).toFixed(0)} Kio`}
+              Capture {e.iface} · {fmtBytes(e.bytes)}
             </span>
             <button className="btn btn-sm" disabled={e.stopping} onClick={() => manager.stop(e.key)}>
               Arrêter

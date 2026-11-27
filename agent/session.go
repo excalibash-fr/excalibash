@@ -310,12 +310,12 @@ func (m *manager) rekey(msg message) {
 // input decrypts keystrokes and writes them to the session's source. Frames that are stale,
 // replayed or fail authentication are dropped.
 func (m *manager) input(msg message) {
-	ts, err := strconv.ParseInt(string(msg.Ts), 10, 64)
-	if err != nil || msg.S == "" || msg.K == 0 {
+	ts, ok := parseTs(msg.Ts)
+	if !ok || msg.S == "" || msg.K == 0 {
 		debugf("input %s: malformed frame", msg.ID)
 		return
 	}
-	if skew := time.Since(time.UnixMilli(ts)); skew > inputMaxSkew || skew < -inputMaxSkew {
+	if !tsInWindow(ts) {
 		debugf("input %s: timestamp out of window", msg.ID)
 		return
 	}

@@ -26,6 +26,12 @@ export function fromB64(s: string): Bytes {
 export const utf8 = (s: string): Bytes => enc.encode(s) as Bytes;
 export const fromUtf8 = (b: Uint8Array): string => dec.decode(b);
 
+/** Lowercase hex of the bytes. */
+export const hex = (buf: ArrayBuffer | Uint8Array): string => Array.from(buf instanceof Uint8Array ? buf : new Uint8Array(buf), (x) => x.toString(16).padStart(2, "0")).join("");
+
+/** SHA-256 as lowercase hex; a string is hashed as UTF-8. */
+export const sha256Hex = async (data: BufferSource | string): Promise<string> => hex(await subtle.digest("SHA-256", typeof data === "string" ? utf8(data) : data));
+
 export function randomBytes(n: number): Bytes {
   return globalThis.crypto.getRandomValues(new Uint8Array(n));
 }
@@ -192,8 +198,7 @@ export async function pairTag(confirm: string, auth: Uint8Array, agentPub: Uint8
 
 export async function fingerprint(pub: Uint8Array): Promise<string> {
   const h = new Uint8Array(await subtle.digest("SHA-256", pub as Bytes)).subarray(0, 20);
-  const hex = [...h].map((x) => x.toString(16).padStart(2, "0")).join("").toUpperCase();
-  return hex.match(/.{4}/g)!.join(" ");
+  return hex(h).toUpperCase().match(/.{4}/g)!.join(" ");
 }
 
 // ---- Accounts ------------------------------------------------------------------------

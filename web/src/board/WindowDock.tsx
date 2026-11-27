@@ -6,6 +6,7 @@ import { isRemoteLabel, type BoardSession } from "./collab.ts";
 import { confirmDialog } from "../components/ui.tsx";
 import { clearBroadcast, liveTargets, useBroadcastGroup } from "./broadcast.ts";
 import { localShellIds } from "./machineFiles.ts";
+import { readStorage, writeStorage } from "../storage.ts";
 
 export type DockItem = { id: string; open: boolean };
 /** `remote`: a Telnet / SSH device, through which nothing else can be reached. */
@@ -63,21 +64,11 @@ export function WindowDock(p: {
     (cb) => p.session.on("terminals", cb),
     () => p.session.terminals.size + p.session.webs.size + [...p.session.terminals.values()].map((t) => t.status).join(),
   );
-  const [collapsed, setCollapsed] = useState(() => {
-    try {
-      return localStorage.getItem(COLLAPSED_KEY) === "1";
-    } catch {
-      return false;
-    }
-  });
+  const [collapsed, setCollapsed] = useState(() => readStorage(COLLAPSED_KEY) === "1");
   const [folded, setFolded] = useState<Set<string>>(new Set());
   const setDockCollapsed = (v: boolean) => {
     setCollapsed(v);
-    try {
-      localStorage.setItem(COLLAPSED_KEY, v ? "1" : "0");
-    } catch {
-      /* private mode */
-    }
+    writeStorage(COLLAPSED_KEY, v ? "1" : "0");
   };
 
   const bcast = useBroadcastGroup();

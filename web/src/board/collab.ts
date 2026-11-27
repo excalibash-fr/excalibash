@@ -157,6 +157,25 @@ export class BoardSession {
     return this.canEdit && this.send({ t: "doc.del", doc, epoch: this.epoch });
   }
 
+  /**
+   * True while a live element refers to the document: a node listing it (copies of a node share
+   * its docIds) or its window. Without a scene we cannot tell, so it counts as referenced.
+   */
+  docReferenced(doc: string): boolean {
+    const api = this.api;
+    if (!api || this.disposed) return true;
+    for (const e of api.getSceneElementsIncludingDeleted()) {
+      if (e.isDeleted) continue;
+      const data = e.customData as Record<string, any> | undefined;
+      if (!data) continue;
+      if (data.codeId === doc || data.notebookId === doc) return true;
+      for (const list of [data.codes, data.notebooks]) {
+        if (Array.isArray(list) && list.some((r) => r && typeof r === "object" && r.docId === doc)) return true;
+      }
+    }
+    return false;
+  }
+
   /** Routes the doc.* messages of `doc` to `handler`; it is told right away if the socket is already up. */
   docRegister(doc: string, handler: DocHandler): () => void {
     this.docHandlers.set(doc, handler);
@@ -494,7 +513,8 @@ export class BoardSession {
         if (data?.node) {
           for (const sh of data.shells ?? []) this.closeTerminal(sh.terminalId);
           for (const w of data.webs ?? []) this.closeWeb(w.webId);
-          // Its code and notebook documents go with it (and the kernels of its notebooks).
+          // Its code and notebook documents go with it (and the kernels of its notebooks), after a
+          // grace period and only if no copy of the node or undo brought a reference back.
           void discardDocs(this, [...docIds(data.codes, false), ...docIds(data.notebooks, true)]);
         }
       }

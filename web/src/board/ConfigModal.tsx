@@ -5,7 +5,7 @@ import type { BoardSession } from "./collab.ts";
 import { extractTopology } from "./topology.ts";
 import { nodeInterfaces, toCiscoIOS, toLinuxIproute, toNetplan, type Generated } from "./configGen.ts";
 import { nodeDataOf } from "./nodeData.ts";
-import { saveBlob } from "./termTools.ts";
+import { saveBlob } from "../download.ts";
 import { Modal, Switch, confirmDialog, copyText, toast } from "../components/ui.tsx";
 
 type Format = "cisco-switch" | "cisco-routeur" | "linux" | "netplan";

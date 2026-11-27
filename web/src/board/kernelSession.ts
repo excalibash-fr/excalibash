@@ -30,6 +30,8 @@ export abstract class KernelSession {
   protected port: TermPort;
   protected canEdit: boolean;
   protected destroyed = false;
+  /** When `status` last changed. */
+  protected statusSince = Date.now();
   private splitter = new LineSplitter();
   private off: (() => void) | null = null;
   private listeners = new Set<() => void>();
@@ -49,52 +51,88 @@ export abstract class KernelSession {
     for (const fn of this.listeners) fn();
   }
 
-  /** An event of the stream that this base class does not consume (exec results, display, done…). */
-  protected abstract onEvent(ev: KernelEvent): void;
+  /**
+   * An event of the stream that this base class does not consume (exec results, display, done…). `line` is its
+   * raw line; `replayed` is true while the scrollback is replayed (it may repeat events already seen).
+   */
+  protected abstract onEvent(ev: KernelEvent, line: string, replayed: boolean): void;
+  /** The scrollback is about to be replayed (first subscription or reconnection): its raw lines. */
+  protected beforeReplay(_lines: ReadonlySet<string>): void {}
+  /** This client stops following the session `term` (another one, or none). */
+  protected leaveSession(_term: string): void {}
 
-  /** Follows the kernel session `term` (or none). The stream is replayed first: every client sees the same events. */
+  protected setStatus(s: KernelStatus) {
+    if (s !== this.status) this.statusSince = Date.now();
+    this.status = s;
+  }
+
+  /** True while a subscription to the kernel session is live. */
+  protected get subscribed(): boolean {
+    return !!this.off;
+  }
+
+  /**
+   * Follows the kernel session `term` (or none). The stream is replayed first: every client sees the same
+   * events. Leaving a session ends this client's runs on it (leaveSession).
+   */
   attach(term: string | null) {
     if (this.destroyed || term === this.term) return;
+    if (this.term) this.leaveSession(this.term);
     this.off?.();
     this.off = null;
     this.term = term;
     this.splitter = new LineSplitter();
     this.dropQueries();
     if (term) this.fatal = null;
-    this.status = term ? "idle" : "absent";
+    // "starting" until the kernel says otherwise (replayed status, or the answer to the ping below).
+    this.setStatus(term ? "starting" : "absent");
     if (term) {
       this.off = this.port.subscribe(term, {
-        onReplay: (d) => {
-          this.splitter = new LineSplitter();
-          this.consume(d);
-        },
+        onReplay: (d) => this.replay(d),
         onData: (d) => this.consume(d),
       });
+      // The bridge answers a ping once its kernel is up: a scrollback without any status is no longer "starting".
+      if (this.canEdit) this.send(encodeOp({ op: "ping" }));
     }
     this.emit();
+  }
+
+  private replay(data: Uint8Array) {
+    this.splitter = new LineSplitter();
+    const lines = this.splitter.push(data);
+    this.beforeReplay(new Set(lines));
+    for (const line of lines) {
+      const ev = parseEvent(line);
+      if (ev) this.handle(ev, line, true);
+    }
   }
 
   private consume(data: Uint8Array) {
     for (const line of this.splitter.push(data)) {
       const ev = parseEvent(line);
-      if (ev) this.handle(ev);
+      if (ev) this.handle(ev, line, false);
     }
   }
 
-  private handle(ev: KernelEvent) {
+  private handle(ev: KernelEvent, line: string, replayed: boolean) {
     switch (ev.ev) {
       case "status":
-        this.status = ev.state;
+        this.setStatus(ev.state);
         this.emit();
         return;
       case "fatal":
-        this.status = "dead";
+        this.setStatus("dead");
         this.fatal = typeof ev.error === "string" ? ev.error.slice(0, 500) : "Noyau arrêté";
         this.emit();
         return;
+      case "pong":
+        if (this.status === "starting") {
+          this.setStatus("idle");
+          this.emit();
+        }
+        return;
       case "ready":
       case "log":
-      case "pong":
         return;
       case "complete":
       case "inspect": {
@@ -107,7 +145,7 @@ export abstract class KernelSession {
         return;
       }
     }
-    this.onEvent(ev);
+    this.onEvent(ev, line, replayed);
   }
 
   /** Sends one request line to the kernel session, in pieces (a terminal frame is limited). */

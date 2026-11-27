@@ -2,6 +2,7 @@ import { db } from "./db.ts";
 import { agentHooks, isMachineOnline, sendAgent } from "./terminals.ts";
 import type { WebSocket } from "ws";
 import { broadcastToBoard } from "./hub.ts";
+import { isRid } from "./validate.ts";
 
 // Web tunnels relay end-to-end encrypted HTTP between a viewer's browser (service worker on the
 // proxy origin) and an agent. The server never sees requests or responses: it only forwards
@@ -156,7 +157,6 @@ type Link = { tunnelId: string; sid: string; machineId: string; ws: WebSocket };
 const links = new Map<string, Link>(); // `${tunnelId}/${sid}`
 const MAX_LINKS_PER_TUNNEL = 64;
 const MAX_BUFFERED = 32 * 1024 * 1024;
-const SID = /^[A-Za-z0-9_-]{16,64}$/;
 
 function closeLinks(match: (l: Link) => boolean, code: number): void {
   for (const [k, l] of links) {
@@ -182,7 +182,7 @@ export function attachTunnelSocket(ws: WebSocket, tunnelId: string): void {
     const t = tunnels.get(tunnelId);
     if (!t) return fail(1001);
     if (!link) {
-      if (msg?.t !== "open" || typeof msg.sid !== "string" || !SID.test(msg.sid) || !Number.isSafeInteger(msg.ts) || typeof msg.d !== "string") return fail(1008);
+      if (msg?.t !== "open" || !isRid(msg.sid) || !Number.isSafeInteger(msg.ts) || typeof msg.d !== "string") return fail(1008);
       const key = `${tunnelId}/${msg.sid}`;
       let n = 0;
       for (const l of links.values()) if (l.tunnelId === tunnelId) n++;

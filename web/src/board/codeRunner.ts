@@ -4,7 +4,7 @@ import type * as Y from "yjs";
 import type { KernelEvent } from "./kernelProtocol.ts";
 import { ExecRunner, type AwarenessLike, type RunResult } from "./execRunner.ts";
 import { applyEventsTo, type WriteState } from "./notebookDoc.ts";
-import { beginCodeRun, codeSink, finishCodeRun, readMeta } from "./codeDoc.ts";
+import { beginCodeRun, codeSink, finishCodeRun, outputsOf, readMeta } from "./codeDoc.ts";
 import type { TermPort } from "./kernelSession.ts";
 
 export class CodeRunner extends ExecRunner {
@@ -24,6 +24,10 @@ export class CodeRunner extends ExecRunner {
   }
   protected finishOrphan(execId: string, count: number | null | undefined) {
     finishCodeRun(this.ydoc, execId, count);
+  }
+  protected resetOutputs(_slot: string, execId: string) {
+    const outs = outputsOf(this.ydoc);
+    if (readMeta(this.ydoc.getMap("meta")).running === execId && outs.length) this.ydoc.transact(() => outs.delete(0, outs.length));
   }
 
   /** Runs `code` (the current content of the window) on the shared kernel; this client becomes the executor. */

@@ -1,11 +1,10 @@
 import { useEffect, useRef, useState } from "react";
 import { ArrowUp, File as FileIcon, Folder, Upload, X } from "lucide-react";
 import type { Entry, FileClient, Listing } from "./fileTransfer.ts";
+import { fmtBytes } from "../format.ts";
 
 const joinPath = (dir: string, name: string) => `${dir.replace(/\/+$/, "")}/${name}`;
 const parentOf = (dir: string) => dir.replace(/\/[^/]*\/*$/, "") || "/";
-
-const fmtSize = (n: number) => (n < 1024 ? `${n} o` : n < 1024 ** 2 ? `${(n / 1024).toFixed(1)} Kio` : `${(n / 1024 ** 2).toFixed(1)} Mio`);
 
 /**
  * Small file picker over the shell's working directory: browse, click a file to download it, or
@@ -95,7 +94,7 @@ export function FilesPanel({
           <button key={e.name} className="term-files-row" title={e.dir ? "Ouvrir le dossier" : onUpload ? "Télécharger" : "Ouvrir ce fichier"} disabled={busy && !e.dir} onClick={() => open(e)}>
             {e.dir ? <Folder size={14} /> : <FileIcon size={14} />}
             <span className="n">{e.name}</span>
-            <span className="s">{e.dir ? "" : fmtSize(e.size)}</span>
+            <span className="s">{e.dir ? "" : fmtBytes(e.size)}</span>
           </button>
         ))}
         {listing?.truncated && <div className="term-files-empty">Liste tronquée (500 entrées au maximum)</div>}

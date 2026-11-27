@@ -10,16 +10,31 @@ export type RotatedDoc = { doc: string; upto: number; d: string };
 
 /**
  * Decrypts the snapshot and every update with the old key, merges them into one Yjs state and
- * boxes it as a snapshot under the new key and epoch. Anything that fails to authenticate aborts
- * the rotation: silently dropping part of someone's document would be worse.
+ * boxes it as a snapshot under the new key and epoch. A part that fails to authenticate or to apply
+ * is skipped and counted in `skipped`: aborting instead would let any editor (or the server) block
+ * a revocation for good by posting one bad frame. Such parts are unreadable by every client anyway.
  */
-export async function reencryptDoc(boardId: string, d: StoredDoc, oldKey: SymKey, newKey: SymKey, newEpoch: number): Promise<RotatedDoc> {
+export async function reencryptDoc(
+  boardId: string,
+  d: StoredDoc,
+  oldKey: SymKey,
+  newKey: SymKey,
+  newEpoch: number,
+): Promise<RotatedDoc & { skipped: number }> {
   const aad = AAD.doc(boardId, d.doc, d.epoch);
   const ydoc = new Y.Doc();
+  let skipped = 0;
+  const apply = async (c: string) => {
+    try {
+      Y.applyUpdate(ydoc, await unbox(oldKey, c, aad));
+    } catch {
+      skipped++;
+    }
+  };
   try {
-    if (d.snap) Y.applyUpdate(ydoc, await unbox(oldKey, d.snap, aad));
-    for (const u of d.ups) Y.applyUpdate(ydoc, await unbox(oldKey, u.d, aad));
-    return { doc: d.doc, upto: d.seq, d: await box(newKey, Y.encodeStateAsUpdate(ydoc), AAD.doc(boardId, d.doc, newEpoch)) };
+    if (d.snap) await apply(d.snap);
+    for (const u of d.ups) await apply(u.d);
+    return { doc: d.doc, upto: d.seq, d: await box(newKey, Y.encodeStateAsUpdate(ydoc), AAD.doc(boardId, d.doc, newEpoch)), skipped };
   } finally {
     ydoc.destroy();
   }

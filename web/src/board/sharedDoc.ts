@@ -46,7 +46,15 @@ const UPDATE_DELAY = 30;
 const AWARENESS_DELAY = 50;
 /** Largest raw update that still fits a frame once boxed and base64-encoded (512 KiB). */
 const MAX_RAW_UPDATE = 380 * 1024;
-const MAX_RAW_SNAPSHOT = 3 * 1024 * 1024;
+/** Largest raw snapshot that still fits the server's MAX_SNAPSHOT (8 MiB of base64) once boxed. */
+const MAX_RAW_SNAPSHOT = 6 * 1024 * 1024 - 1024;
+
+/**
+ * Per host, the outgoing chain of each document being closed. A new handle on the same document
+ * subscribes only once it has finished: otherwise the server would see doc.sub before the old
+ * doc.unsub (StrictMode, quick hide/show) and drop the new subscription.
+ */
+const closing = new WeakMap<DocHost, Map<string, Promise<void>>>();
 
 class Shared {
   readonly ydoc = new Y.Doc();
@@ -54,7 +62,7 @@ class Shared {
   readonly synced: Promise<void>;
   refs = 0;
   private resolveSynced!: () => void;
-  private unregister: () => void;
+  private unregister: () => void = () => {};
   private offPeers: () => void;
   private errors = new Set<(m: string) => void>();
   private goneListeners = new Set<() => void>();
@@ -103,11 +111,24 @@ class Shared {
         this.awarenessTimer ??= setTimeout(() => this.flushAwareness(), AWARENESS_DELAY);
       }
     });
-    this.unregister = host.docRegister(docId, {
-      onOpen: () => this.open(),
-      onClose: () => (this.live = false),
-      onMessage: (m) => this.onMessage(m),
-    });
+    const register = () => {
+      if (this.destroyed) return;
+      this.unregister = host.docRegister(docId, {
+        onOpen: () => this.open(),
+        onClose: () => {
+          this.live = false;
+          // A doc.snapped lost with the socket would otherwise block compaction for good.
+          this.compacting = false;
+        },
+        onMessage: (m) => this.onMessage(m),
+      });
+    };
+    const prev = closing.get(host)?.get(docId);
+    if (prev) {
+      // Our own frames go after the previous handle's last ones too.
+      this.chain = prev;
+      void prev.then(register);
+    } else register();
   }
 
   onError(fn: (m: string) => void) {
@@ -133,7 +154,9 @@ class Shared {
 
   private open() {
     this.live = false;
-    this.gone = false;
+    this.compacting = false;
+    // Deleted for good (the server keeps a tombstone): nothing to subscribe to, nothing to push.
+    if (this.gone) return;
     const me = this.host.you;
     if (me) this.awareness.setLocalStateField("user", { name: me.name, color: me.color });
     this.host.docSend({ t: "doc.sub", doc: this.docId });
@@ -168,6 +191,15 @@ class Shared {
           const before = new Map([...this.awareness.meta].map(([id, m]) => [id, m.clock]));
           applyAwarenessUpdate(this.awareness, await unbox(this.host.key, msg.d, this.aadAw()), REMOTE);
           this.checkAwareness(before, typeof msg.from === "string" ? msg.from : "");
+          // A viewer's presence is shown, but without `execs` (running notebook cells), which only
+          // editors may announce: the server flags viewers' frames with `ro`.
+          if (msg.ro === true) {
+            for (const [id, m] of this.awareness.meta) {
+              if (id === this.awareness.clientID || before.get(id) === m.clock) continue;
+              const st = this.awareness.getStates().get(id) as Record<string, unknown> | undefined;
+              if (st && "execs" in st) delete st.execs;
+            }
+          }
         } catch {
           /* unauthenticated or malformed awareness is ignored */
         }
@@ -286,6 +318,7 @@ class Shared {
   private flushAwareness() {
     clearTimeout(this.awarenessTimer);
     this.awarenessTimer = undefined;
+    // Viewers' awareness is refused by the server (it could forge others' state): not sent.
     if (!this.awarenessDirty || !this.live) return;
     this.awarenessDirty = false;
     const update = encodeAwarenessUpdate(this.awareness, [this.awareness.clientID]);
@@ -316,14 +349,19 @@ class Shared {
     // Tell the others our cursor is gone, then leave the document, in order.
     this.awareness.setLocalState(null);
     clearTimeout(this.awarenessTimer);
+    const { host, docId } = this;
     const bye = this.live ? encodeAwarenessUpdate(this.awareness, [this.awareness.clientID]) : null;
     this.live = false;
-    const { host, docId } = this;
     this.enqueue(async () => {
       if (bye) host.docSend({ t: "doc.aw", doc: docId, d: await box(host.key, bye, AAD.docAwareness(host.boardId, docId, host.currentEpoch)) });
       host.docSend({ t: "doc.unsub", doc: docId });
     });
-    this.chain.then(() => {
+    const done = this.chain;
+    let map = closing.get(host);
+    if (!map) closing.set(host, (map = new Map()));
+    map.set(docId, done);
+    void done.then(() => {
+      if (map.get(docId) === done) map.delete(docId);
       this.awareness.destroy();
       this.ydoc.destroy();
     });

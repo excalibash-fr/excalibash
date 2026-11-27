@@ -30,13 +30,12 @@ const (
 )
 
 type probeHub struct {
-	mu     sync.Mutex
 	auth   []byte
-	nonces map[string]time.Time // request ids seen recently, against replays
+	nonces *nonceSet // request ids seen recently, against replays
 }
 
 func newProbeHub(auth []byte) *probeHub {
-	return &probeHub{auth: auth, nonces: map[string]time.Time{}}
+	return &probeHub{auth: auth, nonces: newNonceSet(maxProbeNonces)}
 }
 
 type probeResult struct {
@@ -47,11 +46,11 @@ type probeResult struct {
 // handle answers one probe request: box(auth, {targets}, "eb:probe:<rid>:<ts>") in, the results
 // boxed under "eb:probe-res:<rid>" out. It runs in its own goroutine.
 func (p *probeHub) handle(msg message, out *outbox) {
-	ts, err := strconv.ParseInt(string(msg.Ts), 10, 64)
-	if err != nil || msg.Rid == "" || len(msg.Rid) > 64 {
+	ts, ok := parseTs(msg.Ts)
+	if !ok || msg.Rid == "" || len(msg.Rid) > 64 {
 		return
 	}
-	if skew := time.Since(time.UnixMilli(ts)); skew > inputMaxSkew || skew < -inputMaxSkew {
+	if !tsInWindow(ts) {
 		debugf("probe %s: timestamp out of window", msg.Rid)
 		return
 	}
@@ -64,7 +63,7 @@ func (p *probeHub) handle(msg message, out *outbox) {
 		debugf("probe %s: authentication failed", msg.Rid)
 		return
 	}
-	if !p.fresh(msg.Rid) {
+	if !p.nonces.claim(msg.Rid) {
 		return
 	}
 	var req struct {
@@ -88,23 +87,6 @@ func (p *probeHub) handle(msg message, out *outbox) {
 		return
 	}
 	out.send(message{T: "probe.res", Rid: msg.Rid, D: b64.EncodeToString(boxed)})
-}
-
-// fresh records a request id, and refuses one already seen.
-func (p *probeHub) fresh(rid string) bool {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	now := time.Now()
-	for n, at := range p.nonces {
-		if now.Sub(at) > nonceLifetime {
-			delete(p.nonces, n)
-		}
-	}
-	if _, seen := p.nonces[rid]; seen {
-		return false
-	}
-	p.nonces[rid] = now
-	return true
 }
 
 // probeAll pings every valid address (a few at a time); anything that is not a plain IP

@@ -26,8 +26,8 @@ const (
 )
 
 var (
-	ifaceRe  = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:@-]{0,31}$`)
-	filterRe = regexp.MustCompile(`^[A-Za-z0-9._:/!()&|<>=-]{1,64}$`)
+	ifaceRe  = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:@-]{0,31}$`) // mirrors web/src/validators.ts
+	filterRe = regexp.MustCompile(`^[A-Za-z0-9._:/!()&|<>=-]{1,64}$`)    // mirrors web/src/validators.ts
 )
 
 // validateCapture checks the interface and filter, and returns the tcpdump arguments. Nothing
