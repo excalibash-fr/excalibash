@@ -64,18 +64,29 @@ export default function CodeDiff({ name, language, theme, machine, local, mode, 
   }, [theme]);
 
   const go = (t: "next" | "previous") => editorRef.current?.goToDiff(t);
-  const onKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === "Escape") {
-      e.stopPropagation();
-      onChoose("cancel");
-    } else if (e.key === "F7") {
-      e.preventDefault();
-      go(e.shiftKey ? "previous" : "next");
-    }
-  };
+  // A native listener: the code window stops key events before they reach React's root, so onKeyDown never fires.
+  // The view takes the focus when it opens, for Échap and F7 to work from the keyboard.
+  const rootRef = useRef<HTMLDivElement>(null);
+  const chooseRef = useRef(onChoose);
+  chooseRef.current = onChoose;
+  useEffect(() => {
+    const el = rootRef.current!;
+    if (!el.contains(document.activeElement)) el.focus();
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        chooseRef.current("cancel");
+      } else if (e.key === "F7") {
+        e.preventDefault();
+        editorRef.current?.goToDiff(e.shiftKey ? "previous" : "next");
+      }
+    };
+    el.addEventListener("keydown", onKey);
+    return () => el.removeEventListener("keydown", onKey);
+  }, []);
 
   return (
-    <div className="code-diff" role="dialog" aria-label={`Différences de ${name}`} onKeyDown={onKeyDown}>
+    <div ref={rootRef} tabIndex={-1} className="code-diff" role="dialog" aria-label={`Différences de ${name}`}>
       <div className="code-diff-head">
         <strong>{mode === "conflict" ? "Écraser le fichier ?" : "Comparaison avec la machine"}</strong>
         <span className="code-diff-sides">à gauche : machine · à droite : document partagé</span>
