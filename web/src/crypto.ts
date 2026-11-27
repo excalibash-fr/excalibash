@@ -39,6 +39,26 @@ export function randomBytes(n: number): Bytes {
 /** Ids generated client-side and bound into AADs. */
 export const randomId = (): string => toB64(randomBytes(16));
 
+/** Tunnel id: 128 random bits as lowercase base32 without padding (26 characters), valid as a hostname label. */
+export function randomTunnelId(): string {
+  const alphabet = "abcdefghijklmnopqrstuvwxyz234567";
+  const bytes = randomBytes(16);
+  let out = "";
+  let bits = 0;
+  let acc = 0;
+  for (const b of bytes) {
+    acc = (acc << 8) | b;
+    bits += 8;
+    while (bits >= 5) {
+      out += alphabet[(acc >>> (bits - 5)) & 31];
+      bits -= 5;
+    }
+    acc &= (1 << bits) - 1;
+  }
+  if (bits > 0) out += alphabet[(acc << (5 - bits)) & 31];
+  return out;
+}
+
 function concat(...parts: Uint8Array[]): Bytes {
   const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
   let o = 0;

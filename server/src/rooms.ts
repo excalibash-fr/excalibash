@@ -27,7 +27,7 @@ import {
   isDeletedDoc,
   isDocId,
 } from "./docs.ts";
-import { isB64Url } from "./validate.ts";
+import { isB64Url, isTunnelId } from "./validate.ts";
 import { closeTunnel, createTunnel, listBoardTunnels, tunnelExists } from "./tunnels.ts";
 
 /** Encrypted element: only the merge metadata is readable by the server. */
@@ -287,7 +287,7 @@ class Room implements BoardRoom {
         if (!editor) return deny("Lecture seule");
         const machine = getMachine(String(msg.machineId));
         if (!machine || !machineAccess(client.user.id, machine, this.boardId)) return deny("Cette machine ne t'est pas partagée");
-        if (!isClientId(msg.id) || tunnelExists(msg.id)) return deny("Identifiant de tunnel invalide");
+        if (!isTunnelId(msg.id) || tunnelExists(msg.id)) return deny("Identifiant de tunnel invalide");
         if (!str(msg.keyForBoard) || !str(msg.keyForAgent) || !str(msg.encLabel)) return deny("Clés manquantes");
         const web = createTunnel({
           id: msg.id,
