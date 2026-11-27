@@ -411,10 +411,24 @@ function Editor({ node }: { node: Node }) {
       const f = await openMachineFile(shell.client, path);
       const docId = newDocId();
       queueInit(docId, { path, name: splitPath(path).name, text: f.text, sha: f.sha });
+      codePaths.current.set(docId, path);
       addCode(x, nodeId, docId);
     } catch (e: any) {
       toast(e?.message ?? "Impossible d'ouvrir ce fichier");
     }
+  };
+
+  /** Machine file of each code window: those opened here, and those every mounted window reports (onPath). */
+  const codePaths = useRef(new Map<string, string>());
+
+  /** A file picked in the explorer of a code window: focus the window already showing it, else open it in a new one. */
+  const openExplorerFile = (nodeId: string, path: string) => {
+    const x = excalidrawRef.current;
+    const data = x && nodeDataOf(findEl(x, nodeId));
+    if (!x || !data) return;
+    const known = (data.codes ?? []).find((c) => codePaths.current.get(c.docId) === path);
+    if (known) return openCode(x, nodeId, known.docId);
+    void openMachineCode(nodeId, path);
   };
 
   /** The node whose "open a notebook of the machine" picker is showing. */
@@ -1092,6 +1106,8 @@ function Editor({ node }: { node: Node }) {
               title={owner?.title?.split("\n")[0] ?? null}
               onHide={editor && nid ? () => hideShell(excalidrawRef.current!, element.id) : undefined}
               onLabel={editor && nid ? (n) => void setDocLabel(excalidrawRef.current!, "code", nid, codeId, n) : undefined}
+              onOpenFile={nid ? (path) => openExplorerFile(nid, path) : undefined}
+              onPath={(path) => void (path ? codePaths.current.set(codeId, path) : codePaths.current.delete(codeId))}
               onRemove={
                 editor && nid
                   ? () => {
