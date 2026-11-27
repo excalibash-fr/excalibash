@@ -39,6 +39,8 @@ import { classifyOutputs } from "./notebookRender.ts";
 import { Outputs } from "./OutputView.tsx";
 import { bindPythonKernel } from "./pyKernel.ts";
 import CodeExplorer from "./CodeExplorer.tsx";
+import { applyEditorSettings, useEditorSettings } from "./editorSettings.ts";
+import { EditorSettingsMenu } from "./EditorSettingsMenu.tsx";
 import { saveBlob } from "../download.ts";
 
 /** What the window needs from the app's UI kit, handed in by the board page (this chunk must not import it: see BoardPage). */
@@ -279,6 +281,12 @@ export default function CodeEmbed({ host, session, docId, nodeId, active, shells
     return bindPythonKernel(ed, model, () => (runner?.term && runner.status !== "dead" ? runner : peekNotebookRunner(session, notebooksRef.current)));
   }, [ready, doc, meta.language, session, runner]);
 
+  // Local editor preferences; declared after the kernel binding so they win over its suggestion defaults.
+  const { settings: editorPrefs } = useEditorSettings();
+  useEffect(() => {
+    if (editorRef.current) applyEditorSettings(editorRef.current, editorPrefs, false, meta.language !== "python");
+  }, [editorPrefs, doc, ready, meta.language, runner]);
+
   const dirty = sha !== null && isDirty(sha, meta.savedSha);
   const text = () => doc!.ydoc.getText("content").toString();
 
@@ -434,10 +442,17 @@ export default function CodeEmbed({ host, session, docId, nodeId, active, shells
   const saveRef = useRef(save);
   saveRef.current = save;
 
-  // Ctrl+S, from the editor or from anywhere in the window.
+  // Ctrl+S, from the editor or from anywhere in the window. Only here: a Monaco command (editor.addCommand) is global
+  // to the page, so with two code windows Ctrl+S in one saved the file of the last one created.
+  // Échap in the "save as" field is handled here too: key events never reach React's root (see WHEEL_AND_KEYS).
   useEffect(() => {
     const el = rootRef.current!;
     const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape" && (e.target as HTMLElement | null)?.closest?.(".code-saveas")) {
+        e.preventDefault();
+        setSaveAs(null);
+        return;
+      }
       if (e.defaultPrevented || e.key.toLowerCase() !== "s" || !(e.ctrlKey || e.metaKey) || e.altKey) return;
       e.preventDefault();
       void saveRef.current(e.shiftKey);
@@ -445,12 +460,6 @@ export default function CodeEmbed({ host, session, docId, nodeId, active, shells
     el.addEventListener("keydown", onKey);
     return () => el.removeEventListener("keydown", onKey);
   }, []);
-  useEffect(() => {
-    const ed = editorRef.current;
-    if (!ed || !ready) return;
-    ed.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => void saveRef.current(false));
-    ed.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyMod.Shift | monaco.KeyCode.KeyS, () => void saveRef.current(true));
-  }, [ready, doc]);
 
   const submitSaveAs = (path: string) => {
     const p = path.trim();
@@ -549,6 +558,7 @@ export default function CodeEmbed({ host, session, docId, nodeId, active, shells
             </option>
           ))}
         </select>
+        <EditorSettingsMenu />
         <div className="code-people" aria-label="Personnes dans le document">
           {people.slice(0, 5).map((p) => (
             <div key={p.clientId} className="avatar" style={{ background: p.color }} title={p.self ? `${p.name} (vous)` : p.name}>
@@ -634,7 +644,6 @@ export default function CodeEmbed({ host, session, docId, nodeId, active, shells
             placeholder="chemin/fichier.py (relatif au dossier du shell, ou absolu)"
             aria-label="Chemin du fichier sur la machine"
             onChange={(e) => setSaveAs(e.target.value)}
-            onKeyDown={(e) => e.key === "Escape" && setSaveAs(null)}
           />
           <button type="submit" className="btn btn-sm btn-primary">
             Enregistrer

@@ -166,9 +166,12 @@ async function handle(e, url) {
   const ref = e.request.referrer ? new URL(e.request.referrer) : null;
   const from = e.clientId ? tunnelOfClient(await self.clients.get(e.clientId)) : ref && ref.origin === self.location.origin ? prefixed(ref)?.id : undefined;
   if (from && from !== route.id) return new Response("Accès à un autre tunnel refusé.", { status: 403, headers: { "content-type": "text/plain; charset=utf-8" } });
+  const t = await getTunnel(route.id);
+  // Paths under /t/<id>/ are relative to the target's path (the agent prepends it): an absolute path of the site
+  // that already starts with it loses it, else a target http://host/app would get /app/app/….
+  if (route.unprefixed && t) route.path = underBase(route.path, t.target);
   // Keep navigations under /t/<id>/ so every page knows its tunnel.
   if (route.unprefixed && e.request.mode === "navigate") return Response.redirect(`/t/${route.id}${route.path}`, 302);
-  const t = await getTunnel(route.id);
   if (!t) return fetch(e.request); // no key yet: the boot page will fetch it
   if (e.request.mode === "navigate" && e.resultingClientId) clientTunnel.set(e.resultingClientId, route.id);
 
@@ -179,7 +182,7 @@ async function handle(e, url) {
   if (cookie) headers.cookie = [cookie];
   // The site sees itself, not the proxy origin.
   if (headers.origin) headers.origin = [t.target.origin];
-  if (headers.referer) headers.referer = [headers.referer[0].replace(new RegExp(`^${self.location.origin}/t/${route.id}`), t.target.origin)];
+  if (headers.referer) headers.referer = [headers.referer[0].replace(new RegExp(`^${self.location.origin}/t/${route.id}`), t.target.origin + basePath(t.target))];
   const body = ["GET", "HEAD"].includes(e.request.method) ? new Uint8Array() : new Uint8Array(await e.request.arrayBuffer());
 
   const rid = b64(crypto.getRandomValues(new Uint8Array(16)));
@@ -217,7 +220,7 @@ async function handle(e, url) {
   const noBody = e.request.method === "HEAD" || [204, 205, 304].includes(status);
   let payload = noBody ? null : unb64(res.b);
   if (payload && ["document", "iframe", "frame"].includes(e.request.destination) && /^text\/html/i.test(out.get("content-type") || "")) {
-    payload = withWebSocketShim(payload, route.id, t.target.origin);
+    payload = withWebSocketShim(withTunnelBase(payload, route.id, t.target), route.id, t.target.origin);
   }
   return new Response(payload, { status, headers: out });
 }
@@ -238,14 +241,43 @@ function withWebSocketShim(bytes, id, origin) {
   return out;
 }
 
+/** The target's path without its trailing slash ("" for a target at the root). */
+const basePath = (target) => target.pathname.replace(/\/+$/, "");
+
+/** A path of the site seen from the tunnel: without the target's own path when it starts with it. */
+function underBase(path, target) {
+  const base = basePath(target);
+  if (!base || !(path === base || path.startsWith(base + "/") || path.startsWith(base + "?"))) return path;
+  return path.slice(base.length) || "/";
+}
+
 function rewriteLocation(loc, id, target) {
   try {
     const u = new URL(loc, target);
     if (u.origin !== target.origin) return loc;
-    return `/t/${id}${u.pathname}${u.search}${u.hash}`;
+    return `/t/${id}${underBase(u.pathname, target)}${u.search}${u.hash}`;
   } catch {
     return loc;
   }
+}
+
+// Single-page apps take their base from <base href="/app/"> (written by the server from the path it was asked:
+// Centreon, Angular…) and redirect when the address doesn't start with it. Under /t/<id>/ that redirect re-adds the
+// whole path at every turn (/t/<id>/app/t/<id>/app/…): the base is moved under the tunnel like a redirect.
+function withTunnelBase(bytes, id, target) {
+  const head = new TextDecoder("latin1").decode(bytes.subarray(0, 65536));
+  const m = /<base\s[^>]*?\bhref\s*=\s*(["']?)([^"'\s>]*)\1/i.exec(head);
+  if (!m || !m[2] || !(m[2].startsWith("/") && !m[2].startsWith("//")) && !/^https?:\/\//i.test(m[2])) return bytes;
+  const href = rewriteLocation(m[2].replace(/&amp;/g, "&"), id, target);
+  if (href === m[2] || /[^\x21-\x7e]|["'<>]/.test(href)) return bytes;
+  const at = m.index + m[0].length - m[1].length - m[2].length;
+  const tag = new Uint8Array(href.length);
+  for (let i = 0; i < href.length; i++) tag[i] = href.charCodeAt(i) & 0xff;
+  const out = new Uint8Array(bytes.length - m[2].length + tag.length);
+  out.set(bytes.subarray(0, at));
+  out.set(tag, at);
+  out.set(bytes.subarray(at + m[2].length), at + tag.length);
+  return out;
 }
 
 function errorPage(text) {
