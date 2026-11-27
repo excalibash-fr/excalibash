@@ -25,6 +25,12 @@ services:
       TLS_SANS: ${TLS_SANS:-}
       # Public URL of the web-tunnel origin behind a reverse proxy (e.g. https://tunnel.example.com)
       PROXY_URL: ${PROXY_URL:-}
+      # Optional: one origin per tunnel, https://<id>.<TUNNEL_DOMAIN>/ (needs PUBLIC_URL and a reverse proxy that
+      # sends X-Tunnel-Host and X-Tunnel-Auth: see the README). TUNNEL_PROXY_SECRET: 32 characters at least.
+      TUNNEL_DOMAIN: ${TUNNEL_DOMAIN:-}
+      TUNNEL_PROXY_SECRET: ${TUNNEL_PROXY_SECRET:-}
+      TUNNEL_SCHEME: ${TUNNEL_SCHEME:-https}
+      TUNNEL_SESSION_HOURS: ${TUNNEL_SESSION_HOURS:-8}
       # Outgoing email for sign-up verification codes (put the real values in .env, not here).
       # Without SMTP_HOST, new accounts are not email-verified.
       SMTP_HOST: ${SMTP_HOST:-}

@@ -414,8 +414,8 @@ Un document partagé est un document Yjs (CRDT) identifié par un `docId` de 128
   - pas de streaming dans le site tunnelisé (les réponses HTTP font au plus 48 Mo, d'où pas de SSE ; les WebSocket, elles, passent) ;
   - les sites ouverts partagent l'origine proxy entre eux, mais pas avec Excalibash (voir les
     risques résiduels) ;
-  - l'origine proxy n'a pas de session : une requête vers un tunnel inconnu est refusée avant que
-    son corps soit lu ;
+  - en mode chemin, l'origine proxy n'a pas de session : une requête vers un tunnel inconnu est refusée avant que
+    son corps soit lu (le mode sous-domaine ci-dessous ajoute un secret, une session et des réponses uniformes) ;
   - en local, `localhost:6767` et `localhost:6768` partagent leurs cookies (les cookies ne dépendent pas du port), et
     sont « same-site ». Le cookie de session est `HttpOnly` et `SameSite=Strict` ; en HTTPS il s'appelle
     `__Host-eb_session`, que le navigateur n'accepte que `Secure`, pour cet hôte exact : une page de l'origine proxy ne
@@ -667,6 +667,58 @@ Un tableau a 20 liens au plus.
   propose `/certificate.pem` à installer dans le navigateur ou le système.
 - `TLS=off` rend le comportement antérieur (HTTP seul), pour un reverse proxy qui fait le TLS.
 
+### Tunnels web en mode sous-domaine
+
+Avec `TUNNEL_DOMAIN`, chaque tunnel est servi à la racine de sa propre origine `https://<id>.<TUNNEL_DOMAIN>/` : les sites
+voient leurs vrais chemins, et chaque tunnel a son IndexedDB, ses cookies et son Service Worker. Sans `TUNNEL_DOMAIN`, rien ne
+change (mode chemin `/t/<id>/`, qui reste utile sans DNS wildcard). Rien de plus n'est lisible par le serveur : le ticket et le
+cookie ne transportent aucun contenu, seulement « ce compte peut joindre ce tunnel ».
+
+- **Identifiant** : 16 octets tirés par le navigateur (`crypto.getRandomValues`), en base32 minuscule sans remplissage
+  (26 caractères `a-z2-7`), donc valable comme nom d'hôte. Le serveur n'accepte que ce format pour créer un tunnel ; les
+  tunnels plus anciens (identifiants base64) ne sont servis qu'en mode chemin.
+- **Reverse proxy** : l'hôte et le secret ne viennent jamais de la requête du navigateur. Le reverse proxy pose
+  `X-Tunnel-Host: $host` et `X-Tunnel-Auth: <TUNNEL_PROXY_SECRET>` (au moins 32 caractères ; le serveur refuse de démarrer sinon) et
+  écrase ceux du client. Le port des tunnels ne doit être joignable que par lui. Pour chaque requête et chaque upgrade WebSocket :
+  1. le secret est comparé en temps constant (SHA-256 des deux valeurs : ni contenu ni longueur ne fuient). Faux ou absent : refus,
+     et `X-Tunnel-Host` n'est même pas lu ;
+  2. `X-Tunnel-Host` (jamais `Host` ni `X-Forwarded-Host`, sans `:port`, en minuscules) doit être exactement `<id>.<TUNNEL_DOMAIN>`,
+     avec un id conforme et un tunnel existant.
+- **Réponses uniformes** : secret faux, hôte invalide, tunnel inconnu ou fermé, session absente ou expirée, accès retiré, `Origin`
+  invalide, adresse bloquée : toutes reçoivent `404`, corps vide, `Cache-Control: no-store` (pour une WebSocket :
+  `404`, `Content-Length: 0`, `Connection: close`). Jamais 444 (code de bannissement automatique de certains pare-feu applicatifs),
+  jamais 401 ni 403 : rien ne permet de distinguer une cause d'une autre, ni de sonder les tunnels existants. Après authentification,
+  les erreurs fonctionnelles restent (400 requête invalide, 429, 504 machine hors ligne).
+- **Session de tunnel** (ticket, puis cookie) :
+  - un compte connecté demande `POST /api/tunnels/:id/ticket` (60 par minute) ; il faut au moins le rôle lecteur sur le tableau du
+    tunnel, sinon 404. Le ticket (32 octets aléatoires) vit 60 s, en mémoire, à usage unique ;
+  - la page de démarrage du tunnel reçoit le ticket avec la clé (par `postMessage`, jamais dans une URL) et l'échange par
+    `POST /eb-proxy/session` (même `Origin` que le tunnel) contre `__Host-eb_tunnel=<jeton>; Path=/; Secure; HttpOnly; SameSite=Lax`
+    (sans `Domain`, `TUNNEL_SESSION_HOURS` heures, 8 par défaut). Le jeton (32 octets) est gardé haché en mémoire, lié à un seul
+    tunnel et au compte, 20 sessions au plus par compte et par tunnel. Un échec n'est pas retenté (pas de boucle de rechargement) ;
+  - le relais (`POST /eb-proxy/req/<id>`) et les WebSocket exigent en plus : l'id de l'hôte, un `Origin` égal à l'origine du tunnel
+    et un cookie valide pour ce tunnel. Toutes les 60 s, le droit de lecture sur le tableau, l'existence du tunnel, la session
+    Excalibash d'origine et la non-suspension du compte sont revérifiés ; les sockets ouvertes le sont aussi ;
+  - fermer ou renouveler la clé d'un tunnel, se déconnecter, « déconnecter les autres appareils », changer ou réinitialiser le mot de
+    passe, suspendre ou supprimer un compte, retirent les sessions concernées, et coupent leurs WebSocket. Elles ne survivent
+    pas à un redémarrage du serveur : les pages repassent par la poignée de main (une navigation refusée recharge la page de démarrage) ;
+  - les liens publics en lecture seule n'affichent pas de fenêtre de site (leurs fenêtres de tunnel sont retirées du contenu) : ils n'ont
+    donc pas de ticket à demander. Sans compte, pas de ticket.
+- **Limites et blocage** : par adresse (`req.ip`, avec `trust proxy` : le reverse proxy doit transmettre `X-Forwarded-For`), 2000
+  requêtes par minute et 600 sockets ; par tunnel, 6000 requêtes par minute. 50 refus (secret, hôte, tunnel, `Origin`) en 10 minutes
+  bloquent l'adresse 15 minutes : elle reçoit le même 404 vide même avec de bonnes valeurs. Un refus pour session absente n'est pas
+  compté (c'est aussi l'aspect d'un onglet resté ouvert après un redémarrage), seulement journalisé. Plus de 300 refus par minute, toutes
+  adresses confondues, produisent une ligne d'alerte par minute. Les compteurs sont en mémoire.
+- **Journal** : une ligne stable par refus sur la sortie standard, faite pour être analysée (règles Wazuh, fail2ban) :
+  `excalibash-security event=tunnel_denied reason=<bad_secret|bad_host|unknown_tunnel|no_session|bad_origin|blocked_ip> ip=<ip> host=<8 premiers caractères de l'id ou -> path=<chemin sans query, 64 caractères au plus>`,
+  `excalibash-security event=tunnel_denied_burst count=<n> window=60s` et `excalibash-security event=ip_blocked scope=tunnel ip=<ip> minutes=15`.
+  Ni secret, ni cookie, ni identifiant complet (un id dans le chemin est remplacé par `-`).
+- **Même site** : le cookie est `SameSite=Lax`. Pour qu'il circule dans l'iframe du tableau, `TUNNEL_DOMAIN` doit être sous le même
+  domaine enregistrable que `PUBLIC_URL` (par exemple `excalibash.example.com` et `tunnel.example.com`), sinon le navigateur le
+  traite comme un cookie tiers.
+- **Pare-feu applicatif** : pour ce mode, laisser le port des tunnels derrière le reverse proxy avec `TLS=off` ; avec TLS actif sur
+  ce port, une requête en clair reçoit la redirection 308 de l'instance, qui n'est pas la réponse uniforme.
+
 ## Risques résiduels (assumés, documentés)
 
 - **Code servi** : le serveur fournit le JavaScript et le binaire de l'agent (`/install.sh`). Un
@@ -689,8 +741,8 @@ Un tableau a 20 liens au plus.
   d'un tunnel appelle un autre tunnel, ou change sa clé. Reste qu'un site piégé, ouvert dans un tunnel
   (par exemple depuis un tableau partagé par quelqu'un d'autre), partage l'IndexedDB et peut intégrer
   une page d'un autre tunnel ouvert dans ce navigateur, puis lire son contenu (même origine). Parade :
-  n'ouvrir que des sites de confiance, ou un profil de navigateur dédié. Une origine par tunnel
-  (sous-domaines) supprimerait ce risque.
+  n'ouvrir que des sites de confiance, ou un profil de navigateur dédié. En mode sous-domaine
+  (`TUNNEL_DOMAIN`), chaque tunnel a sa propre origine et ce risque disparaît ; il reste en mode chemin.
 - **Quotas** : il n'y a pas de quota de stockage par compte. Un tableau est limité à 2000 images
   (512 Mo chiffrés) et chaque socket à 300 messages par seconde, mais avec les inscriptions ouvertes,
   un compte peut encore remplir le disque en créant des tableaux ; les inscriptions sur invitation
@@ -709,8 +761,11 @@ Un tableau a 20 liens au plus.
   ensuite lui serait lisible. Pour un élément dans un dossier, la clé venant du dossier parent l'emporte sur un accès
   qui la contredirait. Le serveur peut aussi glisser dans une rotation un contact déjà épinglé ailleurs.
 - **Origine des tunnels** : l'adresse de l'origine proxy vient de `/api/config`. Un serveur qui en donnerait une autre
-  recevrait la clé du tunnel. L'identifiant d'un tunnel ne change pas quand sa clé est renouvelée : qui le connaît
-  peut encore envoyer du bruit (sans clé) jusqu'à la machine.
+  recevrait la clé du tunnel. L'identifiant d'un tunnel ne change pas quand sa clé est renouvelée : en mode chemin, qui le
+  connaît peut encore envoyer du bruit (sans clé) jusqu'à la machine ; en mode sous-domaine, il faut en plus le secret du
+  reverse proxy et une session de tunnel.
+- **Sessions de tunnel en mémoire** : les tickets et sessions de tunnel disparaissent au redémarrage du serveur (les pages
+  refont la poignée de main) ; un accès retiré à un tableau peut rester utilisable jusqu'à 60 secondes dans un tunnel déjà ouvert.
 - **Verrouillage d'un compte** : 8 tentatives de connexion par minute et par email, quelle que soit l'adresse.
   Un inconnu peut empêcher quelqu'un de se connecter tant qu'il continue.
 - **Coffre ramené en arrière** : le serveur peut resservir une ancienne version du coffre (clés épinglées)
