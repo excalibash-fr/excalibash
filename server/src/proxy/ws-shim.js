@@ -9,6 +9,8 @@
   const script = document.currentScript;
   const ID = script && script.dataset.ebTunnel;
   const TARGET = script && script.dataset.ebTarget;
+  // Where the tunnel is mounted on this origin: /t/<id> in path mode, nothing in subdomain mode.
+  const MOUNT = script && script.dataset.ebMount !== undefined ? script.dataset.ebMount : `/t/${ID}`;
   if (!ID || !TARGET || !/^[A-Za-z0-9_-]{16,43}$/.test(ID)) return;
   let targetHost;
   try {
@@ -95,8 +97,7 @@
       const protos = protocols === undefined ? [] : Array.isArray(protocols) ? protocols.map(String) : [String(protocols)];
       if (protos.some((p) => !TOKEN.test(p)) || new Set(protos).size !== protos.length) throw syntax("Sous-protocole invalide");
 
-      const prefix = `/t/${ID}`;
-      const path = (u.pathname === prefix || u.pathname.startsWith(`${prefix}/`) ? u.pathname.slice(prefix.length) || "/" : u.pathname) + u.search;
+      const path = (MOUNT && (u.pathname === MOUNT || u.pathname.startsWith(`${MOUNT}/`)) ? u.pathname.slice(MOUNT.length) || "/" : u.pathname) + u.search;
       this._u = u;
       this._rs = 0;
       this._binaryType = "blob";

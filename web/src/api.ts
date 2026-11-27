@@ -112,6 +112,9 @@ export const api = {
 /** Public settings of this instance (GET /api/config). */
 export type ServerConfig = {
   proxyUrl: string;
+  /** Subdomain mode: every web tunnel has its own origin <id>.<tunnelDomain>. null: one origin, /t/<id>/. */
+  tunnelDomain: string | null;
+  tunnelScheme: "https" | "http";
   emailVerification: boolean;
   contactEmail: string | null;
   legalName: string | null;

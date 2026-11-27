@@ -29,6 +29,21 @@ sleep 1.5
 UPDATE_V1_BIN="$UPDATE_V1_BIN" UPDATE_SIGN="$UPD/excalibash-sign" UPDATE_KEY="$UPD/release.key" UPDATE_DIST="$UPD/dist" BASE="http://127.0.0.1:$PORT" PROXY="http://127.0.0.1:$PROXY_PORT" DB="$DATA/excalibash.db" npx --yes tsx@4 tests/e2e.mts
 kill $SERVER 2>/dev/null || true
 
+# Tunnels web par sous-domaine (TUNNEL_DOMAIN) : serveur jetable à part, requêtes telles que les enverrait un reverse proxy
+# (X-Tunnel-Host, X-Tunnel-Auth), agent réel. Une minute d'attente pour l'expiration d'un ticket et la revérification des accès.
+TDATA=$(mktemp -d)
+TPORT=${TUNNEL_HOST_PORT:-6795}
+TPROXY_PORT=${TUNNEL_HOST_PROXY_PORT:-6796}
+TUNNEL_SECRET=$(head -c 36 /dev/urandom | od -An -tx1 | tr -d ' \n')
+TUNNEL_DOMAIN=tunnel.localhost TUNNEL_SCHEME=http TUNNEL_PROXY_SECRET="$TUNNEL_SECRET" PUBLIC_URL="http://127.0.0.1:$TPORT" TLS=off SMTP_TRANSPORT=log DATA_DIR="$TDATA" PORT=$TPORT PROXY_PORT=$TPROXY_PORT node --disable-warning=ExperimentalWarning server/src/index.ts >"$TDATA/server.log" 2>&1 &
+TSERVER=$!
+trap 'kill $SERVER $TSERVER 2>/dev/null || true; rm -rf "$DATA" "$TDATA"' EXIT
+sleep 1.5
+status=0
+TUNNEL_SECRET="$TUNNEL_SECRET" BASE="http://127.0.0.1:$TPORT" PROXY="http://127.0.0.1:$TPROXY_PORT" DB="$TDATA/excalibash.db" npx --yes tsx@4 tests/tunnel-host.mts || status=$?
+kill $TSERVER 2>/dev/null || true
+[ "$status" -eq 0 ] || exit "$status"
+
 # Navigateur réel (Chrome piloté par Playwright) : serveur neuf (premier compte créé par l'interface), même agent.
 # Chrome : CHROME_PATH, sinon google-chrome / chromium du PATH. Absent : ignoré en local, échec en CI (variable CI).
 CHROME_PATH=${CHROME_PATH:-$(command -v google-chrome || command -v google-chrome-stable || command -v chromium || command -v chromium-browser || true)}
@@ -38,7 +53,7 @@ if [ -n "$CHROME_PATH" ]; then
   BPROXY_PORT=${BROWSER_PROXY_PORT:-$((PROXY_PORT + 1))}
   UPDATE_INTERVAL_MS=1000 HISTORY_INTERVAL_MIN=0 HISTORY_KEEP=3 TLS=off SMTP_TRANSPORT=log DATA_DIR="$BDATA" PORT=$BPORT PROXY_PORT=$BPROXY_PORT node --disable-warning=ExperimentalWarning server/src/index.ts >"$BDATA/server.log" 2>&1 &
   BSERVER=$!
-  trap 'kill $SERVER $BSERVER 2>/dev/null || true; rm -rf "$DATA" "$BDATA"' EXIT
+  trap 'kill $SERVER $BSERVER 2>/dev/null || true; rm -rf "$DATA" "$TDATA" "$BDATA"' EXIT
   sleep 1.5
   # Captures d'écran en cas d'échec : $BDATA/shots (copiées dans $SHOTS_DIR si défini, pour les artefacts de CI).
   status=0

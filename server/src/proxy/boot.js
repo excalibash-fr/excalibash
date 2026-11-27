@@ -4,12 +4,26 @@
 
 const MAIN_ORIGIN = "__MAIN_ORIGIN__";
 const CERT_URL = "__CERT_URL__"; // set when the instance uses its self-signed certificate
+// Subdomain mode: the id of the tunnel this origin belongs to, written by the server (empty in path mode).
+const HOST_ID = "__TUNNEL_ID__";
+const LAST_BOOT = "eb-boot-at";
 const status = document.getElementById("status");
 const say = (t) => (status.textContent = t);
-const id = (location.pathname.match(/^\/t\/([A-Za-z0-9_-]{16,43})/) || [])[1];
+const id = HOST_ID || (location.pathname.match(/^\/t\/([A-Za-z0-9_-]{16,43})/) || [])[1];
+
+// A handshake that works is followed by a reload; if this page comes back right away the relay is
+// refusing us for another reason: say so instead of looping.
+function justShookHands() {
+  try {
+    return HOST_ID && Date.now() - Number(sessionStorage.getItem(LAST_BOOT)) < 5000;
+  } catch {
+    return false;
+  }
+}
 
 (async () => {
   if (!id) return say("Lien de tunnel invalide.");
+  if (justShookHands()) return say("Le tunnel ne répond pas : rouvre ce site depuis le tableau.");
   if (!("serviceWorker" in navigator)) return say("Ce navigateur ne permet pas les tunnels chiffrés (Service Worker indisponible).");
   try {
     await navigator.serviceWorker.register("/eb-proxy/sw.js", { scope: "/" });
@@ -34,9 +48,26 @@ const id = (location.pathname.match(/^\/t\/([A-Za-z0-9_-]{16,43})/) || [])[1];
   if (!peer) return say("Ouvre ce site depuis son tableau Excalibash (la clé de chiffrement vient de là).");
 
   let done = false;
-  window.addEventListener("message", (e) => {
+  window.addEventListener("message", async (e) => {
     if (done || e.origin !== MAIN_ORIGIN || !e.data || e.data.type !== "eb-proxy-key" || e.data.tunnelId !== id) return;
     done = true;
+    if (HOST_ID) {
+      // The one-time ticket from Excalibash becomes this tunnel's cookie session. No retry, no reload on failure.
+      say("Ouverture de la session…");
+      let ok = false;
+      try {
+        const r = await fetch("/eb-proxy/session", {
+          method: "POST",
+          credentials: "same-origin",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ ticket: e.data.ticket }),
+        });
+        ok = r.status === 204;
+      } catch {
+        /* network error: same message */
+      }
+      if (!ok) return say("Session refusée : rouvre ce site depuis le tableau.");
+    }
     say("Déchiffrement…");
     navigator.serviceWorker.addEventListener("message", (m) => {
       if (m.data && m.data.type === "key-ok" && m.data.tunnelId === id) {
@@ -44,6 +75,11 @@ const id = (location.pathname.match(/^\/t\/([A-Za-z0-9_-]{16,43})/) || [])[1];
           window.opener = null; // the site must not get a handle on Excalibash
         } catch {
           /* not an opened tab */
+        }
+        try {
+          sessionStorage.setItem(LAST_BOOT, String(Date.now()));
+        } catch {
+          /* storage unavailable: no loop guard */
         }
         location.reload();
       }

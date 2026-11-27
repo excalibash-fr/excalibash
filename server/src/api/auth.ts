@@ -28,6 +28,7 @@ import { emailEnabled, sendVerificationCode, verificationRequired } from "../mai
 import { notify } from "../notify.ts";
 import { createChallenge, verifyPow } from "../pow.ts";
 import { kickUser } from "../rooms.ts";
+import { dropUserTunnelSessions } from "../tunnelSessions.ts";
 import { isEmail } from "../validate.ts";
 
 export const authApi = Router();
@@ -279,6 +280,7 @@ authApi.post("/recover/finish", async (req, res) => {
     row.id,
   );
   db.prepare("DELETE FROM sessions WHERE user_id = ?").run(row.id);
+  dropUserTunnelSessions(row.id);
   // Live boards opened with the old sessions are cut too (the client reconnects if it still can).
   kickUser(row.id, 4001, "session terminée");
   createSession(req, res, row.id);
@@ -328,6 +330,7 @@ authApi.post("/password", (req, res) => {
   );
   // Every other device must log in again with the new password.
   db.prepare("DELETE FROM sessions WHERE user_id = ? AND token_hash != ?").run(row.id, currentSessionHash(req) ?? "");
+  dropUserTunnelSessions(row.id, currentSessionHash(req) ?? "");
   kickUser(row.id, 4001, "session terminée");
   res.json({ ok: true });
 });
