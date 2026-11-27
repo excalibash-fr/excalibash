@@ -47,7 +47,7 @@ function fake() {
   f.finish({ name: "capture-lo.pcap", blob: new Blob([new Uint8Array(100)]) });
   await tick();
   ok(delivered.length === 1 && delivered[0][0] === 100 && delivered[0][1] === "x-capture-lo.pcap", "the pcap is delivered once, at the end");
-  ok(m.get("c1:a")?.phase === "done" && toasts[0].includes("100") === false && toasts[0].includes("terminée"), "done entry and notice");
+  ok(m.get("c1:a")?.phase === "done" && toasts[0].includes("terminée : 100 o"), "done entry and notice");
   ok(changes >= 4, "subscribers are told of each change");
   m.dismiss("c1:a");
   ok(!m.get("c1:a") && m.getSnapshot().length === 0, "dismiss forgets a finished capture");
