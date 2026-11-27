@@ -69,6 +69,7 @@ else
 fi
 
 # Export de topologie, génération de config, vérification du schéma, protocole du noyau, fenêtres de code et notebooks (fonctions pures, sans serveur).
+node --disable-warning=ExperimentalWarning --experimental-strip-types server/src/lockout.test.ts
 node --disable-warning=ExperimentalWarning --experimental-strip-types web/src/agentCaps.test.ts
 node --disable-warning=ExperimentalWarning --experimental-strip-types web/src/agentUpdate.test.ts
 node --disable-warning=ExperimentalWarning --experimental-strip-types web/src/board/topology.test.ts
