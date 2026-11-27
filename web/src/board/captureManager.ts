@@ -4,6 +4,7 @@
 import type { BoardSession } from "./collab.ts";
 import type { FileClient, Signal } from "./fileTransfer.ts";
 import { splitDetails } from "./errorDetails.ts";
+import { fmtBytes } from "../format.ts";
 
 export { splitDetails };
 export type CaptureSpec = { iface: string; filter?: string; seconds: number; maxBytes: number };
@@ -73,7 +74,7 @@ export class CaptureManager {
         const file = saveAs(name);
         this.deliver(blob, file);
         this.set({ key, phase: "done", iface: spec.iface, spec, bytes: blob.size, file });
-        this.notify(`Capture sur ${spec.iface} terminée : ${(blob.size / 1024).toFixed(0)} Kio téléchargés`);
+        this.notify(`Capture sur ${spec.iface} terminée : ${fmtBytes(blob.size)} téléchargés`);
       },
       (e: unknown) => {
         if (this.signals.get(key) !== signal) return;

@@ -8,9 +8,9 @@ import { rateLimit, sha256 } from "../auth.ts";
 import { atLeast, getItem, isTrashed, roleOn } from "../access.ts";
 import { HttpError, blob, pid } from "../http.ts";
 import { flushRoom } from "../rooms.ts";
+import { isId22 } from "../validate.ts";
 
 const MAX_LINKS_PER_BOARD = 20;
-const TOKEN_RE = /^[A-Za-z0-9_-]{22}$/; // 128 bits, base64url
 const PUBLIC_ID_RE = /^[0-9a-f]{16}$/;
 
 type LinkRow = {
@@ -97,9 +97,9 @@ publicApi.get("/:token", (req, res) => {
   if (!rateLimit(`public:${req.ip}`, 60)) throw new HttpError(429, "Trop de requêtes, réessaie dans une minute");
   const token = String(req.params.token);
   // Malformed and unknown tokens answer exactly like expired ones.
-  const hash = sha256(TOKEN_RE.test(token) ? token : "invalid");
+  const hash = sha256(isId22(token) ? token : "invalid");
   if (!rateLimit(`public-token:${hash}`, 300)) throw new HttpError(429, "Trop de requêtes, réessaie dans une minute");
-  const link = TOKEN_RE.test(token) ? (db.prepare("SELECT * FROM board_links WHERE token_hash = ?").get(hash) as LinkRow | undefined) : undefined;
+  const link = isId22(token) ? (db.prepare("SELECT * FROM board_links WHERE token_hash = ?").get(hash) as LinkRow | undefined) : undefined;
   const item = link ? getItem(link.board_id) : undefined;
   if (!link || !item || item.kind !== "board" || (link.expires_at !== null && link.expires_at <= Date.now()) || link.key_epoch !== item.key_epoch || isTrashed(item.id)) {
     throw new HttpError(404, NOT_FOUND);

@@ -2,6 +2,7 @@
 // Excalidraw and the `html.dark` rules follow) plus overrides of the CSS variables of styles.css.
 // The user picks one light and one dark theme (built-in or custom); both are kept in this browser
 // (localStorage) and applied before the app loads by public/boot.js, so the page never flashes.
+import { writeStorage } from "./storage.ts";
 
 export type Base = "light" | "dark";
 
@@ -355,9 +356,5 @@ export function applyTheme(t: ThemeDef) {
 
 /** Keeps the variables of the light and dark themes for boot.js (the page never flashes another theme). */
 export function saveBootVars(light: ThemeDef, dark: ThemeDef) {
-  try {
-    localStorage.setItem(THEME_VARS_KEY, JSON.stringify({ light: light.vars, dark: dark.vars }));
-  } catch {
-    /* private mode */
-  }
+  writeStorage(THEME_VARS_KEY, JSON.stringify({ light: light.vars, dark: dark.vars }));
 }

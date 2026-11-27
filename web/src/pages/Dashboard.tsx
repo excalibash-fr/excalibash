@@ -45,6 +45,7 @@ import {
   useLibraryCtx,
   type Node,
 } from "../library.tsx";
+import { readStorage, writeStorage } from "../storage.ts";
 
 type View = "mine" | "folder" | "shared" | "trash";
 
@@ -56,7 +57,7 @@ export function Dashboard({ view }: { view: View }) {
   const { folderId } = useParams();
   const move = useMoveItems();
   const [q, setQ] = useState("");
-  const [sort, setSort] = useState(() => localStorage.getItem("eb-sort") ?? "updated");
+  const [sort, setSort] = useState(() => readStorage("eb-sort") ?? "updated");
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [menu, setMenu] = useState<{ anchor: MenuAnchor; node?: Node; kind: "card" | "move" } | null>(null);
   const [sharing, setSharing] = useState<Node | null>(null);
@@ -279,7 +280,7 @@ export function Dashboard({ view }: { view: View }) {
             value={sort}
             onChange={(e) => {
               setSort(e.target.value);
-              localStorage.setItem("eb-sort", e.target.value);
+              writeStorage("eb-sort", e.target.value);
             }}
           >
             <option value="updated">Modifiés récemment</option>

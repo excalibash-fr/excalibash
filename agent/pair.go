@@ -28,7 +28,13 @@ import (
 // The seal alone is anonymous: the server relays the agent's public key and the code, so it could
 // seal an auth key of its own choosing. The agent also shows a confirmation code that only goes
 // from its screen to the owner's browser, by hand; the browser seals auth ‖ HMAC(confirm, auth ‖ pub),
-// and an auth key the server made up lacks a valid tag. The server gets one guess per pairing.
+// and an auth key the server made up lacks a valid tag. Online, the server gets one guess per
+// pairing: the agent takes a single seal and gives up on the first bad tag.
+//
+// Limit: the tag is not a substitute for the fingerprint check. A server that also substitutes
+// its own key for this agent's (and an owner who approves without comparing fingerprints) gets
+// auth ‖ HMAC(confirm, auth ‖ serverPub) sealed to itself, and can grind the ~40-bit code offline,
+// then seal an auth key this agent would accept. See docs/SECURITY.md, "Appairage par code".
 
 const pairTimeout = 10 * time.Minute
 

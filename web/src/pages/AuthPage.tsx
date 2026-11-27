@@ -6,6 +6,7 @@ import { useAuth } from "../auth.tsx";
 import { checkCode, login, recover, register, resendCode, unlock, verifyEmail, type Session } from "../account.ts";
 import type { KeyPair } from "../crypto.ts";
 import { Logo, copyText } from "../components/ui.tsx";
+import { saveBlob } from "../download.ts";
 import "./auth.css";
 
 type Status = { needsSetup: boolean; registrationOpen: boolean };
@@ -310,11 +311,7 @@ function RecoveryKeyScreen({ recoveryKey, email, onDone }: { recoveryKey: string
   const [saved, setSaved] = useState(false);
   const download = () => {
     const text = `Excalibash — clé de récupération\nCompte : ${email}\nServeur : ${location.origin}\n\n${recoveryKey}\n\nGarde-la hors ligne. Sans elle, un mot de passe oublié = données perdues.\n`;
-    const a = document.createElement("a");
-    a.href = URL.createObjectURL(new Blob([text], { type: "text/plain" }));
-    a.download = "excalibash-cle-de-recuperation.txt";
-    a.click();
-    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+    saveBlob(new Blob([text], { type: "text/plain" }), "excalibash-cle-de-recuperation.txt");
   };
   return (
     <div className="auth">

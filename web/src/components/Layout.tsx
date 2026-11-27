@@ -5,6 +5,7 @@ import { useAuth, useUser } from "../auth.tsx";
 import { MY_ROOT, childrenOf, isShared, moveItem, useLibrary, useLibraryCtx, type Node } from "../library.tsx";
 import { Avatar, Logo, toast, useTheme } from "./ui.tsx";
 import { Onboarding } from "./Onboarding.tsx";
+import { readJson, writeStorage } from "../storage.ts";
 
 export const DRAG_TYPE = "application/x-excalibash-items";
 
@@ -58,22 +59,15 @@ export function useMoveItems() {
 
 function useExpanded() {
   const [open, setOpen] = useState<Set<string>>(() => {
-    try {
-      return new Set(JSON.parse(localStorage.getItem("eb-expanded") ?? "[]"));
-    } catch {
-      return new Set();
-    }
+    const v = readJson<unknown>("eb-expanded");
+    return new Set(Array.isArray(v) ? v : []);
   });
   const toggle = (id: string) =>
     setOpen((prev) => {
       const next = new Set(prev);
       if (next.has(id)) next.delete(id);
       else next.add(id);
-      try {
-        localStorage.setItem("eb-expanded", JSON.stringify([...next]));
-      } catch {
-        /* private mode */
-      }
+      writeStorage("eb-expanded", JSON.stringify([...next]));
       return next;
     });
   return { open, toggle };

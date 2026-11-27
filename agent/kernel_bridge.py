@@ -2,6 +2,7 @@
 # stdin/stdout speak JSON lines (one object per line, UTF-8, ASCII-escaped on output);
 # stderr is captured by the agent and forwarded as {"ev":"log"} lines.
 # The bridge runs one Jupyter kernel for the whole session and executes requests in order.
+import atexit
 import json
 import os
 import queue
@@ -24,12 +25,23 @@ os.dup2(2, 1)
 _out_lock = threading.Lock()
 
 
+# The running bridge, so that every exit path (including os._exit below) can kill its kernel.
+_bridge = None
+
+
+def hard_exit(code):
+    """Leave now, never leaving the kernel behind."""
+    if _bridge is not None:
+        _bridge.kill_kernel()
+    os._exit(code)
+
+
 def emit_raw(line):
     with _out_lock:
         try:
             _out.write(line.encode("ascii") + b"\n")
         except (BrokenPipeError, OSError):
-            os._exit(0)
+            hard_exit(0)
 
 
 def emit(ev):
@@ -42,7 +54,35 @@ def log(text):
 
 def fatal(msg):
     emit({"ev": "fatal", "error": msg})
-    os._exit(1)
+    hard_exit(1)
+
+
+def _death_signal_hook():
+    """A preexec_fn making the kernel receive SIGKILL when this bridge dies (Linux only).
+
+    jupyter_client starts the kernel in a new session, so neither the agent's process-group kill
+    nor the terminal reaches it: without this, a SIGKILLed bridge would leave its kernel running.
+    Everything is resolved here, before any fork, so that the child only makes two system calls.
+    Elsewhere ipykernel's own parent polling (JPY_PARENT_PID) is the fallback.
+    """
+    if not sys.platform.startswith("linux"):
+        return None
+    try:
+        import ctypes
+
+        prctl = ctypes.CDLL(None, use_errno=True).prctl
+        prctl.argtypes = [ctypes.c_int, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong]
+    except (OSError, AttributeError):
+        return None
+    me = os.getpid()
+    PR_SET_PDEATHSIG = 1
+
+    def hook():
+        prctl(PR_SET_PDEATHSIG, signal.SIGKILL, 0, 0, 0)
+        if os.getppid() != me:  # the bridge died before prctl took effect
+            os._exit(1)
+
+    return hook
 
 
 # The user site is disabled by -I; keep the packages installed with `pip install --user` usable
@@ -86,7 +126,11 @@ class Bridge:
         cf = os.path.join(self.rundir, "kernel.json")
         try:
             self.km = KernelManager(kernel_name=self.kernel, connection_file=cf)
-            self.km.start_kernel(cwd=self.cwd)
+            kw = {"cwd": self.cwd}
+            hook = _death_signal_hook()
+            if hook is not None:
+                kw["preexec_fn"] = hook  # forwarded to Popen by jupyter_client's launcher
+            self.km.start_kernel(**kw)
         except NoSuchKernel:
             fatal("noyau Jupyter introuvable : « %s » (jupyter kernelspec list)" % self.kernel)
         except Exception as e:  # noqa: BLE001
@@ -116,13 +160,40 @@ class Bridge:
         emit({"ev": "ready", "kernel": self.kernel, "language": language, "version": version})
         emit({"ev": "status", "state": "idle"})
 
+    def kernel_pid(self):
+        try:
+            pid = self.km.provisioner.pid if self.km is not None and self.km.provisioner else None
+        except Exception:  # noqa: BLE001
+            return None
+        return pid if isinstance(pid, int) and pid > 1 else None
+
+    def kill_kernel(self):
+        """SIGKILL the kernel's whole process group (it leads its own session): fast and safe to
+        call from any thread, a signal handler or several times."""
+        pid = self.kernel_pid()
+        if pid is None:
+            return
+        for kill in (os.killpg, os.kill):
+            try:
+                kill(pid, signal.SIGKILL)
+                return
+            except (ProcessLookupError, PermissionError):
+                continue
+            except OSError:
+                continue
+
     def shutdown(self):
+        if self.closing:
+            return
         self.closing = True
         try:
             if self.kc is not None:
                 self.kc.stop_channels()
         except Exception:  # noqa: BLE001
             pass
+        # Kill the kernel's process group first (it takes the kernel's own children with it), then
+        # let jupyter_client reap it and remove its files.
+        self.kill_kernel()
         try:
             if self.km is not None:
                 self.km.shutdown_kernel(now=True)
@@ -356,15 +427,22 @@ def expand_cwd(cwd):
 
 def main():
     # argv: kernel name, working directory ("" = home); both validated by the agent.
+    global _bridge
     kernel = (sys.argv[1] if len(sys.argv) > 1 else "") or "python3"
     b = Bridge(kernel, expand_cwd(sys.argv[2] if len(sys.argv) > 2 else ""))
+    _bridge = b
 
     def stop(*_):
+        b.kill_kernel()
         b.shutdown()
         os._exit(0)
 
-    signal.signal(signal.SIGTERM, stop)
-    signal.signal(signal.SIGHUP, stop)
+    # Every way out kills the kernel: end of stdin and these signals call stop(), an uncaught
+    # exception runs atexit, os._exit goes through hard_exit(), and SIGKILL of the bridge is
+    # covered by the kernel's parent-death signal (Linux) or ipykernel's parent polling.
+    atexit.register(b.kill_kernel)
+    for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT, signal.SIGQUIT):
+        signal.signal(sig, stop)
     b.start()
     threading.Thread(target=b.worker, daemon=True).start()
 
@@ -395,4 +473,8 @@ def main():
     stop()
 
 
-main()
+try:
+    main()
+finally:
+    if _bridge is not None:
+        _bridge.kill_kernel()

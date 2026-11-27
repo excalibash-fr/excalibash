@@ -1,6 +1,7 @@
 // "Vérifier le schéma": compares what a cable end says (interface, IP, VLAN addresses) with the
 // interfaces a machine really has (agent probe of kind "ifaces"). Pure: no Excalidraw, no network.
 import type { EndInfo, End } from "./cableData.ts";
+import { stripBrackets } from "../validators.ts";
 
 /** One interface of a machine, as the agent reports it (agent/probe.go). */
 export type IfaceInfo = { name: string; up: boolean; running?: boolean; mtu?: number; mac?: string; addrs: string[] };
@@ -44,7 +45,7 @@ function expandV6(s: string): number[] | null {
 /** "10.0.0.1/24", "fe80::1%eth0/64", "[::1]" → canonical address and optional prefix, or null. */
 export function parseCidr(v?: string): Cidr | null {
   if (!v) return null;
-  const [rawAddr, rawPrefix, extra] = v.trim().replace(/^\[|\]$/g, "").split("/");
+  const [rawAddr, rawPrefix, extra] = stripBrackets(v.trim()).split("/");
   if (extra !== undefined || !rawAddr) return null;
   const a = rawAddr.replace(/\]$/, "").split("%")[0];
   let prefix: number | undefined;

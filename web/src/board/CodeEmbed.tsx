@@ -2,7 +2,7 @@
 // Yjs document (sharedDoc.ts). The text and the cursors travel sealed; the file itself lives on
 // the node's machine, read and written through the sealed file channel of a local shell.
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState, useSyncExternalStore } from "react";
-import { ChevronDown, ChevronUp, Download, FileCode2, FolderOpen, FolderTree, Minimize2, Play, Power, RefreshCw, RotateCw, Save, SaveAll, Square, TerminalSquare } from "lucide-react";
+import { ChevronDown, ChevronUp, Download, FileCode2, FolderOpen, FolderTree, GitCompare, Minimize2, Play, Power, RefreshCw, RotateCw, Save, SaveAll, Square, TerminalSquare } from "lucide-react";
 import { MonacoBinding } from "y-monaco";
 import type * as Monaco from "monaco-editor";
 import { monaco } from "./monacoEnv.ts";
@@ -12,6 +12,7 @@ import {
   LANGUAGES,
   cursorStyleSheet,
   initBlank,
+  diffOutcome,
   initFromFile,
   isDirty,
   kernelTermOf,
@@ -27,7 +28,9 @@ import {
   splitPath,
   takeInit,
   type CodeMeta,
+  type DiffChoice,
 } from "./codeDoc.ts";
+import CodeDiff from "./CodeDiff.tsx";
 import { openMachineFile, pickLocalShell, saveMachineFile, sendCommand } from "./machineFiles.ts";
 import { acquireCode, peekNotebookRunner, sessionEnv } from "./notebookService.ts";
 import type { CodeRunner } from "./codeRunner.ts";
@@ -36,6 +39,7 @@ import { classifyOutputs } from "./notebookRender.ts";
 import { Outputs } from "./OutputView.tsx";
 import { bindPythonKernel } from "./pyKernel.ts";
 import CodeExplorer from "./CodeExplorer.tsx";
+import { saveBlob } from "../download.ts";
 
 /** What the window needs from the app's UI kit, handed in by the board page (this chunk must not import it: see BoardPage). */
 export type CodeHost = {
@@ -128,6 +132,7 @@ export default function CodeEmbed({ host, session, docId, nodeId, active, shells
   const [people, setPeople] = useState<Person[]>([]);
   const [busy, setBusy] = useState<string | null>(null);
   const [saveAs, setSaveAs] = useState<string | null>(null);
+  const [diff, setDiff] = useState<{ machine: string; local: string; mode: "compare" | "conflict"; note?: string; canTake?: boolean; done: (c: DiffChoice) => void } | null>(null);
   const readOnly = !session.canEdit || !!doc?.readOnly;
   // The dock shows the file name: editors keep it in the node (a no-op when it is already there).
   const labelRef = useRef(onLabel);
@@ -390,16 +395,17 @@ export default function CodeEmbed({ host, session, docId, nodeId, active, shells
     }
     const r = await saveMachineFile(shell.client, path, text(), {
       baseSha: path === meta.path ? meta.savedSha : undefined,
-      confirm: (reason) =>
-        confirmDialog({
-          title: "Écraser le fichier ?",
-          text:
-            reason === "changed"
-              ? `« ${path} » a été modifié sur la machine depuis l'ouverture — écraser ?`
-              : `« ${path} » existe déjà sur la machine — écraser ?`,
-          confirm: "Écraser",
-          danger: true,
-        }),
+      confirm: async (reason) => {
+        const note = reason === "changed" ? `« ${path} » a été modifié sur la machine depuis l'ouverture.` : `« ${path} » existe déjà sur la machine.`;
+        // Show the differences when the machine's version can be read; else the plain question.
+        const f = await openMachineFile(shell.client, path).catch(() => null);
+        if (!f) return confirmDialog({ title: "Écraser le fichier ?", text: `${note} Écraser ?`, confirm: "Écraser", danger: true });
+        const choice = await new Promise<DiffChoice>((done) => setDiff({ machine: f.text, local: text(), mode: "conflict", note, canTake: path === meta.path, done }));
+        setDiff(null);
+        const o = diffOutcome(choice);
+        if (o.adopt && path === meta.path) adoptMachine(f);
+        return o.save;
+      },
     });
     if (!r) return false;
     ownPath.current = r.path;
@@ -454,30 +460,41 @@ export default function CodeEmbed({ host, session, docId, nodeId, active, shells
     void guard("save", async () => void (await write(p)));
   };
 
+  /** Replaces the document by the machine's version, which becomes the saved one. */
+  const adoptMachine = (f: { text: string; sha: string }) => {
+    if (!doc) return;
+    const t = doc.ydoc.getText("content");
+    doc.ydoc.transact(() => {
+      t.delete(0, t.length);
+      t.insert(0, f.text);
+      const m = doc.ydoc.getMap("meta");
+      m.set("savedSha", f.sha);
+      m.set("savedAt", Date.now());
+      if (session.you?.name) m.set("savedBy", session.you.name);
+    });
+  };
+
+  const compare = () => {
+    if (!doc || !shell || !meta.path) return;
+    void guard("diff", async () => {
+      const f = await openMachineFile(shell.client, meta.path!);
+      await new Promise<void>((done) => setDiff({ machine: f.text, local: text(), mode: "compare", done: () => done() }));
+      setDiff(null);
+    });
+  };
+
   const reload = async () => {
     if (!doc || !shell || !meta.path || readOnly) return;
     if (dirty && !(await confirmDialog({ title: "Recharger depuis la machine ?", text: "Les modifications non enregistrées du document, pour tout le monde, seront perdues.", confirm: "Recharger", danger: true }))) return;
     await guard("reload", async () => {
       const f = await openMachineFile(shell.client, meta.path!);
-      const t = doc.ydoc.getText("content");
-      doc.ydoc.transact(() => {
-        t.delete(0, t.length);
-        t.insert(0, f.text);
-        const m = doc.ydoc.getMap("meta");
-        m.set("savedSha", f.sha);
-        m.set("savedAt", Date.now());
-        if (session.you?.name) m.set("savedBy", session.you.name);
-      });
+      adoptMachine(f);
     });
   };
 
   const download = () => {
     if (!doc) return;
-    const a = document.createElement("a");
-    a.href = URL.createObjectURL(new Blob([text()], { type: "text/plain;charset=utf-8" }));
-    a.download = meta.name;
-    a.click();
-    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+    saveBlob(new Blob([text()], { type: "text/plain;charset=utf-8" }), meta.name);
   };
 
   const cmd = meta.path ? runCommand(meta.path, meta.language) : runCommand(meta.name, meta.language);
@@ -553,6 +570,14 @@ export default function CodeEmbed({ host, session, docId, nodeId, active, shells
         >
           <RefreshCw size={14} />
         </button>
+        <button
+          title={!meta.path ? "Ce document n'est lié à aucun fichier de la machine" : shell ? "Comparer avec la machine" : noShell}
+          aria-label="Comparer avec la machine"
+          disabled={!shell || !meta.path || !!busy || !ready || !!diff}
+          onClick={compare}
+        >
+          <GitCompare size={14} />
+        </button>
         <button title="Télécharger" disabled={!ready} onClick={download}>
           <Download size={14} />
         </button>
@@ -623,6 +648,7 @@ export default function CodeEmbed({ host, session, docId, nodeId, active, shells
         <div className={`code-main${tree && onOpenFile ? " with-tree" : ""}`}>
           {tree && onOpenFile && <CodeExplorer shell={shell} startDir={meta.path ? splitPath(meta.path).dir : undefined} current={meta.path} readOnly={readOnly} noShell={noShell} onOpen={onOpenFile} />}
           <div ref={hostRef} className="code-host" />
+          {diff && <CodeDiff name={meta.name} language={meta.language} theme={theme} machine={diff.machine} local={diff.local} mode={diff.mode} note={diff.note} canTake={diff.canTake} onChoose={diff.done} />}
           {!ready && <div className="term-veil">{error ?? "Connexion au document…"}</div>}
           {ready && error && <div className="term-veil bottom">{error}</div>}
         </div>

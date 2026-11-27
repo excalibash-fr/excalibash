@@ -8,6 +8,7 @@ import { AAD, boxJson, randomId, unboxJson } from "../crypto.ts";
 import type { Machine } from "../vault.ts";
 import { cableOf, vlanParts, type End } from "./cables.ts";
 import { findEl, nodeDataOf } from "./nodes.ts";
+import { stripBrackets } from "../validators.ts";
 
 export type LinkState = { up: boolean; ms?: number; from: string };
 /** By `${cableId}:${end}` (the IP written at that end) or `${cableId}:${end}:v${vlan}` (its address in a VLAN): its reachability. */
@@ -15,7 +16,7 @@ export type LinkStates = Record<string, LinkState>;
 
 /** The address part of what was typed ("10.0.0.1/24" → "10.0.0.1"), or null. */
 export function ipOf(v?: unknown): string | null {
-  const ip = typeof v !== "string" ? undefined : v.trim().split("/")[0].replace(/^\[|\]$/g, "");
+  const ip = typeof v !== "string" ? undefined : stripBrackets(v.trim().split("/")[0]);
   return ip && /^[0-9A-Fa-f:.]{2,45}$/.test(ip) ? ip : null;
 }
 

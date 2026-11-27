@@ -26,6 +26,7 @@ import {
   type KeyPair,
   type SymKey,
 } from "./crypto.ts";
+import { readJson, removeStorage, writeStorage } from "./storage.ts";
 
 /** Pinned public keys of the people we shared with, by account id and by email. */
 type VaultData = { contacts: Record<string, string>; emails?: Record<string, string>; placements?: Record<string, string | null> };
@@ -229,20 +230,13 @@ export async function setShareBoards(id: string, on: boolean) {
 // have our machine handed to a board's editors.
 const LINKED = (boardId: string) => `eb-machine-links:${boardId}`;
 function linkedHere(boardId: string): Set<string> {
-  try {
-    const v = JSON.parse(localStorage.getItem(LINKED(boardId)) ?? "[]");
-    return new Set(Array.isArray(v) ? v.filter((x) => typeof x === "string") : []);
-  } catch {
-    return new Set();
-  }
+  const v = readJson<unknown>(LINKED(boardId));
+  return new Set(Array.isArray(v) ? v.filter((x) => typeof x === "string") : []);
 }
 function setLinkedHere(boardId: string, ids: Set<string>) {
-  try {
-    if (ids.size) localStorage.setItem(LINKED(boardId), JSON.stringify([...ids]));
-    else localStorage.removeItem(LINKED(boardId));
-  } catch {
-    /* private mode: links are just not restored after a key rotation */
-  }
+  // In private mode the links are just not restored after a key rotation.
+  if (ids.size) writeStorage(LINKED(boardId), JSON.stringify([...ids]));
+  else removeStorage(LINKED(boardId));
 }
 
 const putLink = async (board: { id: string; key: SymKey }, m: Machine) =>

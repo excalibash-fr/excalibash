@@ -8,6 +8,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -311,5 +312,69 @@ func TestJupyterUnknownKernel(t *testing.T) {
 	}
 	if code := tm.exit(t); code != 1 {
 		t.Fatalf("exit code %d", code)
+	}
+}
+
+func TestJupyterSessionCap(t *testing.T) {
+	// With every slot taken, a new session is refused before anything is started.
+	for i := 0; i < maxKernels; i++ {
+		kernelSlots <- struct{}{}
+	}
+	defer func() {
+		for i := 0; i < maxKernels; i++ {
+			<-kernelSlots
+		}
+	}()
+	tm := startTerm(t, target{Kind: "jupyter", Kernel: "python3"})
+	f, _ := tm.await(t, 0, 10*time.Second, "fatal", is("fatal"))
+	if !strings.Contains(f["error"].(string), "trop de noyaux") {
+		t.Fatalf("fatal: %v", f)
+	}
+	if code := tm.exit(t); code != 1 {
+		t.Fatalf("exit code %d", code)
+	}
+}
+
+func TestJupyterKernelDiesWithBridge(t *testing.T) {
+	// jupyter_client puts the kernel in its own session: SIGKILL the bridge alone (not its group)
+	// and check that the kernel follows, through its parent-death signal or ipykernel's polling.
+	if !haveJupyter() {
+		t.Skip("python3 with jupyter_client and ipykernel not available")
+	}
+	dir, _ := filepath.EvalSymlinks(t.TempDir())
+	tm := startTerm(t, target{Kind: "jupyter", Kernel: "python3", Cwd: dir})
+	_, pos := tm.await(t, 0, 90*time.Second, "ready", is("ready"))
+	tm.op(kev{"op": "exec", "id": "pid", "code": "import os; print(os.getpid())"})
+	s, _ := tm.await(t, pos, 20*time.Second, "pid", is("stream", "id", "pid"))
+	kernel, err := strconv.Atoi(strings.TrimSpace(s["text"].(string)))
+	if err != nil {
+		t.Fatalf("kernel pid %q", s["text"])
+	}
+	bridge := 0
+	for _, pid := range procsMentioning(dir) {
+		if cl, _ := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/cmdline"); strings.Contains(string(cl), "Excalibash kernel bridge") {
+			bridge = pid
+		}
+	}
+	if bridge == 0 {
+		t.Fatal("bridge process not found")
+	}
+	if err := syscall.Kill(bridge, syscall.SIGKILL); err != nil {
+		t.Fatal(err)
+	}
+	tm.exit(t)
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		alive := false
+		for _, pid := range procsMentioning(dir) {
+			alive = alive || pid == kernel
+		}
+		if !alive {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("kernel %d outlived its SIGKILLed bridge", kernel)
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
 }

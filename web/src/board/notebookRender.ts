@@ -117,7 +117,8 @@ const IMAGE_MIMES = ["image/png", "image/jpeg", "image/gif"] as const;
  */
 export function stripMeta(html: string): string {
   for (;;) {
-    const next = html.replace(/<meta\b[^>]*(>|$)/gi, "");
+    // <link> (dns-prefetch, preload…) and <base> go too: the frame's CSP does not cover every one of them.
+    const next = html.replace(/<\/?\s*(meta|link|base)\b[^>]*(>|$)/gi, "");
     if (next === html) return html;
     html = next;
   }
