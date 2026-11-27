@@ -1,6 +1,7 @@
 import { Router } from "express";
 import { db } from "../db.ts";
 import { currentSessionHash, destroySession, rateLimit, requireUser, verifySecret, getUserRow } from "../auth.ts";
+import { assertNotLocked, failed, succeeded } from "../lockout.ts";
 import { kickSession } from "../rooms.ts";
 import { dropMainSessionTunnels, dropUserTunnelSessions } from "../tunnelSessions.ts";
 import { HttpError, blob } from "../http.ts";
@@ -91,12 +92,18 @@ accountApi.delete("/sessions/:id", (req, res) => {
   res.json({ ok: true, current: row.token_hash === currentSessionHash(req) });
 });
 
-accountApi.delete("/", (req, res) => {
+accountApi.delete("/", async (req, res) => {
   const user = req.user!;
   if (!rateLimit(`account-delete:${user.id}`, 5, 15 * 60_000)) throw new HttpError(429, "Trop d'essais, réessaie plus tard");
   const authKey = blob(req.body?.authKey, 100);
+  const keys = { account: user.id, ip: req.ip! };
+  assertNotLocked("reauth", keys);
   const row = getUserRow(user.id);
-  if (!row || !verifySecret(authKey, row.auth_hash)) throw new HttpError(403, "Mot de passe incorrect");
+  if (!row || !verifySecret(authKey, row.auth_hash)) {
+    await failed("reauth", keys);
+    throw new HttpError(403, "Mot de passe incorrect");
+  }
+  succeeded("reauth", keys);
   if (user.isAdmin) {
     const others = db.prepare("SELECT COUNT(*) AS n FROM users WHERE id != ?").get(user.id) as { n: number };
     const admins = db.prepare("SELECT COUNT(*) AS n FROM users WHERE is_admin = 1 AND id != ?").get(user.id) as { n: number };

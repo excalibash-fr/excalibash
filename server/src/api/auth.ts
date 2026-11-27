@@ -27,6 +27,7 @@ import { config } from "../config.ts";
 import { emailEnabled, sendVerificationCode, verificationRequired } from "../mailer.ts";
 import { notify } from "../notify.ts";
 import { createChallenge, verifyPow } from "../pow.ts";
+import { assertNotLocked, failed, succeeded } from "../lockout.ts";
 import { kickUser } from "../rooms.ts";
 import { dropUserTunnelSessions } from "../tunnelSessions.ts";
 import { isEmail } from "../validate.ts";
@@ -50,13 +51,11 @@ export function announceSetup() {
   console.log(`Code d'installation (création du compte administrateur) : ${setupCode.slice(0, 4)}-${setupCode.slice(4)}`);
 }
 
-function checkSetupCode(code: unknown) {
+function setupCodeMatches(code: unknown): boolean {
   if (!setupCode) announceSetup();
   const given = Buffer.from(normalizeCode(code));
   const want = Buffer.from(setupCode ?? "");
-  if (given.length !== want.length || !timingSafeEqual(given, want)) {
-    throw new HttpError(403, "Code d'installation invalide : il est affiché dans les logs du serveur");
-  }
+  return given.length === want.length && timingSafeEqual(given, want);
 }
 
 function registrationOpen(): boolean {
@@ -124,7 +123,11 @@ authApi.post("/register", async (req, res) => {
   let invite: InviteRow | undefined;
   if (userCount() === 0) {
     limit(`setup:${req.ip}`, 10, 600_000);
-    checkSetupCode(b.setupCode);
+    assertNotLocked("login", { ip: req.ip! });
+    if (!setupCodeMatches(b.setupCode)) {
+      await failed("login", { ip: req.ip! });
+      throw new HttpError(403, "Code d'installation invalide : il est affiché dans les logs du serveur");
+    }
   } else if (b.invite) {
     invite = db.prepare("SELECT * FROM invites WHERE token_hash = ?").get(sha256(String(b.invite))) as InviteRow | undefined;
     if (!invite || invite.used_by || invite.expires_at < Date.now()) throw new HttpError(403, "Invitation invalide ou expirée");
@@ -186,24 +189,30 @@ authApi.post("/register", async (req, res) => {
   res.json({ user: toUser(getUserRow(b.id)!) });
 });
 
-authApi.post("/verify", (req, res) => {
+authApi.post("/verify", async (req, res) => {
   const email = str(req.body.email);
   const code = str(req.body.code, 12);
   limit(`verify:${req.ip}`, 20);
   limit(`verify:${email.toLowerCase()}`, 10);
-  const bad = () => new HttpError(400, "Code incorrect ou expiré");
+  const keys = { account: email, ip: req.ip! };
+  assertNotLocked("login", keys);
   const row = findUserByEmail(email);
-  if (!row) throw bad();
+  const bad = async () => {
+    await failed("login", keys, row ? { account: row.id } : {});
+    return new HttpError(400, "Code incorrect ou expiré");
+  };
+  if (!row) throw await bad();
   const f = flags(row.id);
-  if (f.email_verified || !f.verify_code_hash || !f.verify_expires || f.verify_expires < Date.now()) throw bad();
+  if (f.email_verified || !f.verify_code_hash || !f.verify_expires || f.verify_expires < Date.now()) throw await bad();
   if (f.verify_attempts >= 5) {
     db.prepare("UPDATE users SET verify_code_hash = NULL, verify_expires = NULL WHERE id = ?").run(row.id);
-    throw bad();
+    throw await bad();
   }
   db.prepare("UPDATE users SET verify_attempts = verify_attempts + 1 WHERE id = ?").run(row.id);
   const a = Buffer.from(sha256(code));
   const b = Buffer.from(f.verify_code_hash);
-  if (a.length !== b.length || !timingSafeEqual(a, b)) throw bad();
+  if (a.length !== b.length || !timingSafeEqual(a, b)) throw await bad();
+  succeeded("login", keys);
   db.prepare("UPDATE users SET email_verified = 1, verify_code_hash = NULL, verify_expires = NULL, verify_attempts = 0 WHERE id = ?").run(row.id);
   checkSuspended(row.id);
   createSession(req, res, row.id);
@@ -229,12 +238,16 @@ authApi.post("/login", async (req, res) => {
   const email = str(req.body.email);
   limit(`login:${req.ip}`, 20);
   limit(`login:${email.toLowerCase()}`, 8);
+  const keys = { account: email, ip: req.ip! };
+  assertNotLocked("login", keys);
   const row = findUserByEmail(email);
   const authKey = String(req.body.authKey ?? "");
   if (!row || !(await verifySecretAsync(authKey, row.auth_hash))) {
     if (!row) await burnVerifyAsync(authKey);
+    await failed("login", keys, row ? { account: row.id } : {});
     throw new HttpError(401, "Email ou mot de passe incorrect");
   }
+  succeeded("login", keys);
   if (!flags(row.id).email_verified) coded(403, "Vérifie ton email pour te connecter.", "EMAIL_NOT_VERIFIED");
   checkSuspended(row.id);
   createSession(req, res, row.id);
@@ -248,30 +261,33 @@ authApi.post("/login", async (req, res) => {
   res.json({ user: toUser(row), keys: { publicKey: row.public_key, encPrivateKey: row.enc_private_key } });
 });
 
-/** Step 1 of account recovery: prove the recovery key, receive the private key encrypted under it. */
-authApi.post("/recover", async (req, res) => {
+/** The account whose recovery key the request proves (401 otherwise); failures are counted like logins. */
+async function checkRecoveryKey(req: Request): Promise<UserRow> {
   const email = str(req.body.email);
   limit(`recover:${req.ip}`, 5);
+  const keys = { account: email, ip: req.ip! };
+  assertNotLocked("recover", keys);
   const row = findUserByEmail(email);
   const proof = String(req.body.recoveryAuth ?? "");
   if (!row || !(await verifySecretAsync(proof, row.recovery_auth_hash))) {
     if (!row) await burnVerifyAsync(proof);
+    await failed("recover", keys, row ? { account: row.id } : {});
     throw new HttpError(401, "Email ou clé de récupération incorrecte");
   }
+  succeeded("recover", keys);
+  return row;
+}
+
+/** Step 1 of account recovery: prove the recovery key, receive the private key encrypted under it. */
+authApi.post("/recover", async (req, res) => {
+  const row = await checkRecoveryKey(req);
   checkSuspended(row.id);
   res.json({ userId: row.id, publicKey: row.public_key, recoveryEncPrivateKey: row.recovery_enc_private_key });
 });
 
 /** Step 2: set a new password (re-encrypted private key), logging out every other session. */
 authApi.post("/recover/finish", async (req, res) => {
-  const email = str(req.body.email);
-  limit(`recover:${req.ip}`, 5);
-  const row = findUserByEmail(email);
-  const proof = String(req.body.recoveryAuth ?? "");
-  if (!row || !(await verifySecretAsync(proof, row.recovery_auth_hash))) {
-    if (!row) await burnVerifyAsync(proof);
-    throw new HttpError(401, "Email ou clé de récupération incorrecte");
-  }
+  const row = await checkRecoveryKey(req);
   checkSuspended(row.id);
   db.prepare("UPDATE users SET auth_hash = ?, kdf_salt = ?, enc_private_key = ? WHERE id = ?").run(
     await hashSecretAsync(blob(req.body.authKey, 100)),
@@ -318,10 +334,16 @@ authApi.put("/vault", (req, res) => {
   res.json({ ok: true });
 });
 
-authApi.post("/password", (req, res) => {
+authApi.post("/password", async (req, res) => {
   limit(`pw:${req.user!.id}`, 5);
+  const keys = { account: req.user!.id, ip: req.ip! };
+  assertNotLocked("reauth", keys);
   const row = getUserRow(req.user!.id)!;
-  if (!verifySecret(String(req.body.authKey ?? ""), row.auth_hash)) throw new HttpError(400, "Mot de passe actuel incorrect");
+  if (!verifySecret(String(req.body.authKey ?? ""), row.auth_hash)) {
+    await failed("reauth", keys);
+    throw new HttpError(400, "Mot de passe actuel incorrect");
+  }
+  succeeded("reauth", keys);
   db.prepare("UPDATE users SET auth_hash = ?, kdf_salt = ?, enc_private_key = ? WHERE id = ?").run(
     hashSecret(blob(req.body.newAuthKey, 100)),
     blob(req.body.newSalt, 64),

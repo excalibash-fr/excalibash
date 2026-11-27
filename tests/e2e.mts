@@ -257,6 +257,30 @@ const bob = await register("bob@test.local", "Bob", "bob-password-12");
   ok(good.status === 200 && good.body.user?.email === dave && !!jar.current, "bon code accepté : session ouverte");
   const after = await api("POST", "/auth/login", { email: dave, authKey: b64 });
   ok(after.status === 200, "connexion possible après vérification");
+
+  // Brute force: 10 failures lock the account 15 minutes, even for the right password; an unknown email is locked
+  // and answers just the same. The per-minute limits (8 per email, 20 per address) come first and answer "dans une
+  // minute": on those, wait for the next minute and go on, so only real failures (401) are counted.
+  const unknownEmail = "fantome@test.local";
+  const wrongLogin = (email: string) => api("POST", "/auth/login", { email, authKey: "Z".repeat(16) });
+  const fail10 = async (email: string) => {
+    for (let n = 0; n < 10; ) {
+      const r = await wrongLogin(email);
+      if (r.status === 401) n++;
+      else if (/une minute/.test(r.body.error)) await new Promise((res) => setTimeout(res, 61_000));
+      else return r;
+    }
+    return undefined;
+  };
+  const stray = await Promise.all([fail10(dave), fail10(unknownEmail)]);
+  ok(stray.every((r) => !r), "10 mauvais mots de passe : tous refusés en 401 (existant ou non)");
+  const lockedReal = await api("POST", "/auth/login", { email: dave, authKey: b64 });
+  const lockedGhost = await api("POST", "/auth/login", { email: unknownEmail, authKey: b64 });
+  ok(lockedReal.status === 429 && /plus tard/.test(lockedReal.body.error), "11e tentative avec le BON mot de passe : compte verrouillé (429)");
+  ok(lockedGhost.status === 429 && JSON.stringify(lockedGhost.body) === JSON.stringify(lockedReal.body), "email inexistant : même verrou, même réponse");
+  const security = readFileSync(`${dirname(DB)}/server.log`, "utf8").split("\n").filter((l) => l.startsWith("excalibash-security "));
+  ok(security.filter((l) => l.includes("event=account_locked scope=login")).length >= 2, "journal : excalibash-security event=account_locked pour les deux comptes");
+  ok(security.some((l) => l.includes("event=auth_failed scope=login ip=")) && !security.some((l) => l.includes("@")), "journal : auth_failed avec l'IP, jamais d'email");
 }
 await as(alice, () => api("PATCH", "/admin/settings", { registrationOpen: false }));
 // Findable by name (default) and by email (off by default); a hidden account answers like a missing one.

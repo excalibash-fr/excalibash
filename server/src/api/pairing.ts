@@ -3,6 +3,7 @@ import { randomInt, randomBytes } from "node:crypto";
 import { db, isClientId } from "../db.ts";
 import { rateLimit, requireUser, sha256 } from "../auth.ts";
 import { getMachine } from "../access.ts";
+import { assertNotLocked, failed } from "../lockout.ts";
 import { HttpError, blob, publicUrl } from "../http.ts";
 import { pinFor } from "../tls.ts";
 import { pinPreamble } from "../install.ts";
@@ -104,10 +105,14 @@ pairingOwnerApi.delete("/:code", (req, res) => {
 
 export const pairingAgentApi = Router();
 
-pairingAgentApi.post("/:code", (req, res) => {
+pairingAgentApi.post("/:code", async (req, res) => {
   if (!rateLimit(`pair:${req.ip}`, 20)) throw new HttpError(429, "Trop de tentatives");
+  assertNotLocked("pair", { ip: req.ip! });
   const p = live(normalize(req.params.code));
-  if (!p) throw new HttpError(404, "Code inconnu ou expiré");
+  if (!p) {
+    await failed("pair", { ip: req.ip! });
+    throw new HttpError(404, "Code inconnu ou expiré");
+  }
   if (p.agentPub) throw new HttpError(410, "Code déjà utilisé");
   const pub = blob(req.body.pub, 60);
   if (Buffer.from(pub, "base64url").length !== 32) throw new HttpError(400, "Clé invalide");
@@ -116,10 +121,14 @@ pairingAgentApi.post("/:code", (req, res) => {
   res.status(202).json({ ok: true });
 });
 
-pairingAgentApi.get("/:code", (req, res) => {
+pairingAgentApi.get("/:code", async (req, res) => {
   if (!rateLimit(`pairpoll:${req.ip}`, 120)) throw new HttpError(429, "Trop de requêtes");
+  assertNotLocked("pair", { ip: req.ip! });
   const p = live(normalize(req.params.code));
-  if (!p || !p.agentPub || req.query.pub !== p.agentPub) throw new HttpError(404, "Appairage introuvable");
+  if (!p || !p.agentPub || req.query.pub !== p.agentPub) {
+    await failed("pair", { ip: req.ip! });
+    throw new HttpError(404, "Appairage introuvable");
+  }
   if (!p.approved) {
     res.status(202).json({ status: "waiting" });
     return;
