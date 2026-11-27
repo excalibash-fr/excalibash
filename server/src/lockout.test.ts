@@ -64,21 +64,21 @@ now += 15 * 60_000 + 1;
 await fail(1, "b@x.y");
 ok(locked("login", { account: "b@x.y", ip: "3.3.3.3" }) === null, "failures older than 15 minutes are forgotten");
 
-// IP: 30 failures over any accounts (and IP-only keys), a success does not clear it.
+// IP: 100 failures over any accounts (and IP-only keys), a success does not clear it.
 resetLockout();
-for (let i = 0; i < 29; i++) await failed("login", { account: `u${i}@x.y`, ip: "4.4.4.4" });
-ok(locked("login", { account: "fresh@x.y", ip: "4.4.4.4" }) === null, "29 failures from an IP: not locked");
+for (let i = 0; i < 99; i++) await failed("login", { account: `u${i}@x.y`, ip: "4.4.4.4" });
+ok(locked("login", { account: "fresh@x.y", ip: "4.4.4.4" }) === null, "99 failures from an IP: not locked");
 succeeded("login", { account: "u0@x.y" });
-await failed("login", { account: "u29@x.y", ip: "4.4.4.4" });
-ok(locked("login", { account: "fresh@x.y", ip: "4.4.4.4" })?.status === 429, "30 failures from an IP (many accounts): IP locked, success did not clear it");
+await failed("login", { account: "u99@x.y", ip: "4.4.4.4" });
+ok(locked("login", { account: "fresh@x.y", ip: "4.4.4.4" })?.status === 429, "100 failures from an IP (many accounts): IP locked, success did not clear it");
 ok(locked("login", { account: "fresh@x.y", ip: "5.5.5.5" }) === null, "another IP is free");
 ok(locked("pair", { ip: "4.4.4.4" }) === null, "the IP lock is per scope");
 
-// IP-only scope (pairing, setup code): no delay, locks at 30.
+// IP-only scope (pairing, setup code): no delay, locks at 100.
 resetLockout();
 delays.length = 0;
-for (let i = 0; i < 30; i++) await failed("pair", { ip: "6.6.6.6" });
-ok(delays.length === 0 && locked("pair", { ip: "6.6.6.6" })?.status === 429, "IP-only scope: locked after 30 failures, never delayed");
+for (let i = 0; i < 100; i++) await failed("pair", { ip: "6.6.6.6" });
+ok(delays.length === 0 && locked("pair", { ip: "6.6.6.6" })?.status === 429, "IP-only scope: locked after 100 failures, never delayed");
 
 // Capped number of entries.
 resetLockout();

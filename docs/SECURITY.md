@@ -65,7 +65,7 @@ un chiffré d'un objet à un autre.
 - **Force brute** (en plus des limites par minute) : les échecs sont comptés par compte et par adresse (`req.ip`), pour la
   connexion et la vérification du code email (« login »), la récupération par clé (« recover »), le changement de mot de passe
   et la suppression du compte (« reauth »), l'appairage d'une machine (« pair ») et le code d'installation. Le compte est
-  verrouillé 15 minutes après 10 échecs en 15 minutes, et une adresse après 30 échecs (tous comptes confondus, par fonction).
+  verrouillé 15 minutes après 10 échecs en 15 minutes, et une adresse après 100 échecs (tous comptes confondus, par fonction : assez haut pour une salle entière derrière une seule adresse).
   Dès le 4e échec sur un compte, la réponse est retardée (250 ms, doublés à chaque échec, 4 s au plus). Pendant un verrou,
   le serveur ne vérifie rien : un 429 « Trop de tentatives, réessaie plus tard » identique, que le compte existe ou non et que le
   mot de passe soit juste ou non. Un succès remet à zéro le compteur du compte, mais pas celui de l'adresse ni un verrou en cours.

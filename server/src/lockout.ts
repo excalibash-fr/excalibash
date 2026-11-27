@@ -11,7 +11,7 @@ type Keys = { account?: string; ip: string };
 const WINDOW_MS = 15 * 60_000; // failures are counted over this window…
 const LOCK_MS = 15 * 60_000; // …and a key that reaches its cap is locked for this long
 const ACCOUNT_MAX = 10; // failures per account (all IPs)
-const IP_MAX = 30; // failures per IP (all accounts), per scope
+const IP_MAX = 100; // failures per IP (all accounts), per scope: a whole classroom can share one address
 const DELAY_FROM = 4; // from this failure on, the answer is slowed down: 250 ms, 500 ms, … up to 4 s
 const MAX_TRACKED = 50_000;
 
