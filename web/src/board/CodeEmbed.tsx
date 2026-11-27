@@ -2,7 +2,7 @@
 // Yjs document (sharedDoc.ts). The text and the cursors travel sealed; the file itself lives on
 // the node's machine, read and written through the sealed file channel of a local shell.
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState, useSyncExternalStore } from "react";
-import { ChevronDown, ChevronUp, Download, FileCode2, FolderOpen, GitCompare, Minimize2, Play, Power, RefreshCw, RotateCw, Save, SaveAll, Square, TerminalSquare } from "lucide-react";
+import { ChevronDown, ChevronUp, Download, FileCode2, FolderOpen, FolderTree, GitCompare, Minimize2, Play, Power, RefreshCw, RotateCw, Save, SaveAll, Square, TerminalSquare } from "lucide-react";
 import { MonacoBinding } from "y-monaco";
 import type * as Monaco from "monaco-editor";
 import { monaco } from "./monacoEnv.ts";
@@ -25,6 +25,7 @@ import {
   safeColor,
   safeLabel,
   sha256Hex,
+  splitPath,
   takeInit,
   type CodeMeta,
   type DiffChoice,
@@ -37,6 +38,7 @@ import { kernelCwd } from "./notebookDoc.ts";
 import { classifyOutputs } from "./notebookRender.ts";
 import { Outputs } from "./OutputView.tsx";
 import { bindPythonKernel } from "./pyKernel.ts";
+import CodeExplorer from "./CodeExplorer.tsx";
 import { applyEditorSettings, useEditorSettings } from "./editorSettings.ts";
 import { EditorSettingsMenu } from "./EditorSettingsMenu.tsx";
 import { saveBlob } from "../download.ts";
@@ -67,6 +69,10 @@ type Props = {
   onRemove?: () => void;
   /** The file name changed (opened, saved as): the node remembers it as the label of this window. */
   onLabel?: (name: string) => void;
+  /** A file picked in the explorer: the board opens (or focuses) its window on this node. */
+  onOpenFile?: (path: string) => void;
+  /** The machine file this window shows (null when none), each time it changes. */
+  onPath?: (path: string | null) => void;
 };
 
 type Person = { clientId: number; name: string; color: string; self: boolean };
@@ -117,7 +123,7 @@ function useDoc(session: BoardSession, docId: string) {
   return { doc, runner, ready, error };
 }
 
-export default function CodeEmbed({ host, session, docId, nodeId, active, shells, notebookDocs, title, onHide, onRemove, onLabel }: Props) {
+export default function CodeEmbed({ host, session, docId, nodeId, active, shells, notebookDocs, title, onHide, onRemove, onLabel, onOpenFile, onPath }: Props) {
   const { doc, runner, ready, error } = useDoc(session, docId);
   const { theme, confirm: confirmDialog, toast } = host;
   const rootRef = useRef<HTMLDivElement>(null);
@@ -136,6 +142,12 @@ export default function CodeEmbed({ host, session, docId, nodeId, active, shells
   useEffect(() => {
     if (ready && !readOnly) labelRef.current?.(meta.name);
   }, [ready, readOnly, meta.name]);
+  // The board remembers which file each open window shows, so the explorer focuses it rather than opening it twice.
+  const pathRef = useRef(onPath);
+  pathRef.current = onPath;
+  useEffect(() => {
+    if (ready) pathRef.current?.(meta.path ?? null);
+  }, [ready, meta.path]);
 
   // Shell statuses live in the session: re-render when they change.
   useSyncExternalStore(
@@ -144,6 +156,20 @@ export default function CodeEmbed({ host, session, docId, nodeId, active, shells
   );
   const shell = pickLocalShell(session, { shells: shells.map((terminalId) => ({ terminalId })) });
   const noShell = "Aucun shell local en cours sur cette machine";
+  // The explorer is this user's own view (not in the document); its open / closed state is remembered here.
+  const [tree, setTree] = useState(() => {
+    try {
+      return localStorage.getItem("excalibash.codeTree") === "1";
+    } catch {
+      return false;
+    }
+  });
+  const toggleTree = () => {
+    setTree(!tree);
+    try {
+      localStorage.setItem("excalibash.codeTree", tree ? "0" : "1");
+    } catch {}
+  };
 
   // Keep keys, clipboard and wheel inside the editor instead of reaching the canvas.
   useEffect(() => {
@@ -513,6 +539,11 @@ export default function CodeEmbed({ host, session, docId, nodeId, active, shells
           {dirty && <span className="code-dirty" title="Modifications non enregistrées sur la machine" />}
           {title && <span className="status"> · {title.split("\n")[0]}</span>}
         </span>
+        {onOpenFile && (
+          <button className={tree ? "on" : ""} title={shell || tree ? (tree ? "Masquer les fichiers" : "Afficher les fichiers de la machine") : noShell} disabled={!shell && !tree} onClick={toggleTree}>
+            <FolderTree size={14} />
+          </button>
+        )}
         <select
           className="code-lang"
           value={meta.language}
@@ -623,7 +654,8 @@ export default function CodeEmbed({ host, session, docId, nodeId, active, shells
         </form>
       )}
       <div className="term-body code-body">
-        <div className="code-main">
+        <div className={`code-main${tree && onOpenFile ? " with-tree" : ""}`}>
+          {tree && onOpenFile && <CodeExplorer shell={shell} startDir={meta.path ? splitPath(meta.path).dir : undefined} current={meta.path} readOnly={readOnly} noShell={noShell} onOpen={onOpenFile} />}
           <div ref={hostRef} className="code-host" />
           {diff && <CodeDiff name={meta.name} language={meta.language} theme={theme} machine={diff.machine} local={diff.local} mode={diff.mode} note={diff.note} canTake={diff.canTake} onChoose={diff.done} />}
           {!ready && <div className="term-veil">{error ?? "Connexion au document…"}</div>}
