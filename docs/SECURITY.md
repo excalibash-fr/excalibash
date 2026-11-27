@@ -74,6 +74,41 @@ un chiffré d'un objet à un autre.
   et `event=ip_locked scope=<…> ip=<ip> minutes=15`. Limites : les compteurs sont en mémoire (un redémarrage les efface) et un
   tiers qui connaît un email peut verrouiller ce compte 15 minutes : compromis assumé, qu'une authentification à deux facteurs ne
   change pas.
+- **Double authentification (TOTP)** : facultative, activée par chaque compte (« Mon compte → Double authentification »).
+  - *Algorithme* : RFC 6238 (HMAC-SHA1, 6 chiffres, pas de 30 s, fenêtre de ±1 pas), compatible avec les applications
+    d'authentification usuelles. Secret de 20 octets aléatoires, montré une fois en QR code (dessiné dans le navigateur, sans
+    service externe) et en base32. Comparaison en temps constant ; un pas déjà accepté (ou plus ancien) est refusé, donc un
+    code ne sert qu'une fois (rejeu impossible).
+  - *Stockage* : le serveur doit pouvoir vérifier le code, il connaît donc le secret : **c'est un facteur côté serveur, distinct du
+    chiffrement de bout en bout** (il protège l'accès au compte, pas le déchiffrement des données, qui dépend du mot de passe et de
+    la clé privée, jamais envoyés). Le secret est chiffré en AES-256-GCM (lié à l'identifiant du compte) avec une clé dérivée de
+    `server_secret`, qui se trouve dans la même base : le chiffrement protège les exports partiels et les journaux, pas contre
+    quelqu'un qui détient toute la base. Les 10 codes de secours (`XXXXX-XXXXX`, alphabet sans caractères ambigus, affichés une seule fois) ne sont gardés
+    que sous forme de hachage SHA-256 et chacun est supprimé à l'usage.
+  - *Connexion* : avec le bon mot de passe et la double authentification active, `/api/auth/login` ne crée ni session ni ne renvoie
+    de clés : il répond `mfaRequired` et un jeton à usage unique (32 octets aléatoires, gardé haché en mémoire, valable 5 minutes,
+    détruit au 5e mauvais code). `POST /api/auth/mfa` (jeton + code TOTP ou code de secours) ouvre alors la session. Les échecs
+    comptent dans la fonction « mfa » du verrou contre la force brute (par compte et par adresse, contrôlé avant toute
+    vérification) ; un mauvais code, un code de secours inconnu et un jeton périmé donnent la même réponse « Code incorrect ».
+  - *Récupération* : la clé de récupération ne contourne pas le second facteur. Pour un compte qui en a un, `/recover` indique
+    `mfaRequired` et `/recover/finish` exige un code (même contrôle, même réponse d'erreur). Un compte qui a perdu sa clé de
+    récupération, son mot de passe **et** son second facteur (appareil et codes de secours) n'est pas récupérable par lui-même : un administrateur
+    peut réinitialiser la double authentification (sans toucher au mot de passe ni aux données), mais pas récupérer le compte.
+  - *Gestion* : activer, régénérer les codes de secours et désactiver passent par `/api/account/mfa/*` ; le mot de passe est redemandé
+    pour activer et désactiver (fonction « reauth »), un code pour activer (preuve que l'application a le secret), régénérer et
+    désactiver. Le secret n'est renvoyé que par l'étape d'activation.
+  - *Administrateurs* : le réglage « MFA obligatoire pour les administrateurs » (Administration → Sécurité, `mfa_required_admins`)
+    ne s'active que depuis un compte qui a lui-même la double authentification. Il est alors refusé aux administrateurs de la
+    désactiver, et un administrateur qui n'en a pas garde sa session mais reçoit `403 MFA_REQUIRED` sur toute l'API
+    d'administration, jusqu'à l'avoir activée. Un administrateur peut réinitialiser la double authentification d'un autre compte
+    (jamais du sien) ; sans autre administrateur, on la désactive directement dans la base :
+    `UPDATE users SET totp_enabled = 0, totp_secret = NULL, totp_pending = NULL, totp_last_step = 0 WHERE email = '…'` puis
+    `DELETE FROM mfa_backup_codes WHERE user_id = (SELECT id FROM users WHERE email = '…')`.
+  - *Journal* (`excalibash-security`, jamais de code ni de secret) : `event=auth_failed scope=mfa`, `event=account_locked scope=mfa`,
+    `event=mfa_enabled account=<id>`, `event=mfa_disabled account=<id>`, `event=mfa_backup_used account=<id> remaining=<n>` et
+    `event=mfa_reset by=<id admin> account=<id>`.
+  - *Limites* : le facteur est vérifié par le serveur (voir plus haut) ; les jetons de connexion en attente et les compteurs de
+    verrouillage sont en mémoire (un redémarrage les efface) ; un code est valable jusqu'à 90 secondes à cause de la fenêtre de ±1 pas.
 - Mot de passe perdu : la clé de récupération permet d'en redéfinir un. Sans elle, les données sont perdues.
 - Déconnexion, changement de mot de passe, récupération ou suppression du compte : les sessions
   concernées sont supprimées et les connexions temps réel ouvertes sont coupées.
